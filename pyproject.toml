@@ -296,6 +296,7 @@ members = [
     "lib/crewai-files",
     "lib/cli",
     "lib/crewai-core",
+    "lib/caspar-bridge",
 ]
 
 
@@ -306,3 +307,4 @@ crewai-devtools = { workspace = true }
 crewai-files = { workspace = true }
 crewai-cli = { workspace = true }
 crewai-core = { workspace = true }
+decillion-caspar-bridge = { workspace = true }
