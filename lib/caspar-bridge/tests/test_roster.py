@@ -1,6 +1,6 @@
 """A Decillion listing becomes a CrewAI agent with no second source of truth."""
 
-from decillion_caspar_bridge.roster import llm_kwargs, model_ref
+from decillion_caspar_bridge.roster import PROXY_API_KEY, llm_kwargs, model_ref
 
 
 def test_model_ref_prefixes_a_bare_model_with_its_provider():
@@ -25,11 +25,18 @@ def test_unknown_provider_passes_the_model_through_unchanged():
     assert model_ref({"provider": "somethingnew", "model": "m1"}) == "m1"
 
 
-def test_gateway_providers_get_a_base_url_with_their_key():
-    kwargs = llm_kwargs({"provider": "agentrouter"}, {"agentrouter": "k"})
-    assert kwargs["api_key"] == "k"
-    assert kwargs["base_url"] == "https://agentrouter.org/v1"
+def test_every_model_is_addressed_through_the_platform_proxy_with_no_real_key():
+    # A provider key must never be inside the sandbox: an agent that gets a
+    # shell here would find the platform's account. Every vendor, gateway or
+    # not, is reached the same way — through the bridge.
+    kwargs = llm_kwargs({"provider": "agentrouter"}, "http://127.0.0.1:8788/v1")
+    assert kwargs["base_url"] == "http://127.0.0.1:8788/v1"
+    assert kwargs["api_key"] == PROXY_API_KEY
+    assert llm_kwargs({"provider": "openai"}, "http://127.0.0.1:8788/v1") == kwargs
 
 
-def test_a_provider_without_a_key_contributes_nothing():
-    assert llm_kwargs({"provider": "openai"}, {}) == {}
+def test_without_a_proxy_nothing_is_configured_rather_than_reaching_a_model_unmetered():
+    # No proxy means no metered path. LiteLLM then falls back to the process
+    # environment, which in this sandbox holds no key either, so the agent
+    # reports that it cannot reach a model instead of quietly reaching one.
+    assert llm_kwargs({"provider": "openai"}, "") == {}

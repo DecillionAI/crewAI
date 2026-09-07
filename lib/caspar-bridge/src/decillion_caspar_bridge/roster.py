@@ -35,11 +35,10 @@ _PROVIDER_PREFIX = {
     "agentrouter": "openai",  # an OpenAI-compatible gateway
 }
 
-#: Providers reached through an OpenAI-compatible gateway rather than their own
-#: endpoint. These need a base URL as well as a key.
-_GATEWAY_BASE_URL = {
-    "agentrouter": "https://agentrouter.org/v1",
-}
+#: The placeholder credential the platform's proxy is addressed with. LiteLLM
+#: refuses to call an OpenAI-compatible endpoint with no key at all, and there
+#: is no real key in this sandbox to give it — that is the whole point.
+PROXY_API_KEY = "decillion-proxy"
 
 
 def model_ref(llm: dict[str, Any] | None) -> str | None:
@@ -61,30 +60,34 @@ def model_ref(llm: dict[str, Any] | None) -> str | None:
     return f"{prefix}/{model}" if prefix else model
 
 
-def llm_kwargs(llm: dict[str, Any] | None, keys: dict[str, str]) -> dict[str, Any]:
-    """Credentials and endpoint for one agent's model.
+def llm_kwargs(llm: dict[str, Any] | None, proxy_base_url: str) -> dict[str, Any]:
+    """Where one agent's model calls go.
 
-    `keys` are the platform keys the crew creature sent, narrowed to the
-    providers this project's agents actually use. A provider with no key gets
-    no kwargs and CrewAI falls back to the process environment.
+    Every model an agent runs on is addressed through the platform's proxy, and
+    NO credential is passed: this sandbox holds none. The proxy is a loopback
+    endpoint served by the bridge, which forwards each call over its socket to
+    the `llm` creature — the only place a provider key is ever read, and the
+    place that records what the provider said the call cost.
+
+    Handing the key to the sandbox instead (which is what used to happen) put
+    the platform's account one container escape away from anyone who could get
+    an agent to run a shell, and left the token counts that a run is billed on
+    being reported by the very process being billed.
+
+    Without a proxy — a runtime older than one, or one that failed to start —
+    no kwargs are returned and LiteLLM falls back to the process environment,
+    which in this sandbox has no key either. An agent that cannot reach a model
+    says so; it does not quietly reach one unmetered.
     """
-    if not llm:
+    if not llm or not proxy_base_url:
         return {}
-    provider = str(llm.get("provider") or "").strip().lower()
-    out: dict[str, Any] = {}
-    api_key = keys.get(provider)
-    if api_key:
-        out["api_key"] = api_key
-    base_url = _GATEWAY_BASE_URL.get(provider)
-    if base_url:
-        out["base_url"] = base_url
-    return out
+    return {"api_key": PROXY_API_KEY, "base_url": proxy_base_url}
 
 
 def build_agent(
     spec: dict[str, Any],
     universal_prompt: str,
-    llm_keys: dict[str, str],
+    proxy_base_url: str,
     tools: list[Any] | None = None,
 ) -> "Agent":
     """One Decillion agent, as a CrewAI agent.
@@ -108,7 +111,7 @@ def build_agent(
     llm = None
     if model:
         try:
-            llm = LLM(model=model, **llm_kwargs(llm_spec, llm_keys))
+            llm = LLM(model=model, **llm_kwargs(llm_spec, proxy_base_url))
         except Exception:  # noqa: BLE001 - a bad model must not lose the agent
             logger.exception("could not build LLM %s; falling back to the default", model)
 
@@ -130,7 +133,7 @@ def build_agent(
 def build_roster(
     specs: list[dict[str, Any]],
     universal_prompt: str,
-    llm_keys: dict[str, str],
+    proxy_base_url: str,
 ) -> dict[str, "Agent"]:
     """Every agent on the project, keyed by its Decillion program id.
 
@@ -144,7 +147,7 @@ def build_roster(
         if not program_id:
             continue
         try:
-            roster[program_id] = build_agent(spec, universal_prompt, llm_keys)
+            roster[program_id] = build_agent(spec, universal_prompt, proxy_base_url)
         except Exception:  # noqa: BLE001 - one bad listing must not empty the team
             logger.exception("skipping agent %s: could not be built", program_id)
     return roster

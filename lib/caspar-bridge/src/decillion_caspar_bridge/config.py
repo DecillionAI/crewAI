@@ -22,6 +22,9 @@ class BridgeConfig:
     token: str
     crew_home: str
     log_level: str
+    #: Loopback port the platform's model proxy listens on. Configurable only
+    #: so a sandbox image that already uses the default can move it.
+    llm_proxy_port: int
 
     @property
     def configured(self) -> bool:
@@ -51,4 +54,13 @@ def load_config() -> BridgeConfig:
         token=os.environ.get("DECILLION_BRIDGE_TOKEN", "").strip(),
         crew_home=os.environ.get("CREWAI_HOME", "/opt/crewai").strip(),
         log_level=os.environ.get("DECILLION_LOG_LEVEL", "INFO").strip().upper(),
+        llm_proxy_port=_port(os.environ.get("DECILLION_LLM_PROXY_PORT"), 8788),
     )
+
+
+def _port(raw: str | None, fallback: int) -> int:
+    try:
+        value = int(str(raw or "").strip())
+    except ValueError:
+        return fallback
+    return value if 1 <= value <= 65535 else fallback

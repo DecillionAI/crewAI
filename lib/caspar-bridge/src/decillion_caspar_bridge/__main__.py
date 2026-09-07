@@ -14,6 +14,7 @@ import sys
 
 from .client import CasparBridgeClient
 from .config import load_config
+from .llm_proxy import LlmProxyServer
 from .runtime import CrewRuntime
 
 logger = logging.getLogger("decillion_caspar_bridge")
@@ -38,7 +39,14 @@ async def _run() -> int:
         assert client is not None
         return await client.signal(action, payload)
 
-    runtime = CrewRuntime(config.space_id, send)
+    # The platform's model proxy. It runs before the runtime because an agent's
+    # LLM is built against its base URL: the sandbox holds no provider key, and
+    # every model call goes back out through the bridge to the `llm` creature,
+    # which makes the real call and counts what it cost.
+    llm_proxy = LlmProxyServer(send, port=config.llm_proxy_port)
+    await llm_proxy.start()
+
+    runtime = CrewRuntime(config.space_id, send, llm_proxy)
 
     async def on_update(key: str, data: dict) -> None:
         """Everything the project's creatures push to this bridge."""
@@ -97,6 +105,7 @@ async def _run() -> int:
 
     await stop.wait()
     logger.info("shutting down")
+    await llm_proxy.close()
     await client.close()
     serve.cancel()
     return 0
