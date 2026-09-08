@@ -1,18 +1,31 @@
 """The Caspar client wire protocol, as spoken over a WebSocket.
 
-Frames match `drivers/network/framing.rs`:
-
-    request  : u32be(len) | 0x03 | lp(signature) | lp(userId) | lp(path)
+    request  : u32be(len) | lp(signature) | lp(userId) | lp(path)
                           | lp(packetId) | payload
-    response :             0x02 | lp(packetId)  | u32be(resCode) | payload
-    update   :             0x01 | lp(key)       | payload
+    response :              0x02 | lp(packetId) | u32be(resCode) | payload
+    update   :              0x01 | lp(key)      | payload
 
     lp(x) = u32be(len(x)) || x
 
-The asymmetry is deliberate and matches the node: a client wraps every outgoing
-WebSocket message in the same 4-byte length prefix the TCP transport uses (the
-node strips it), while the node's own frames arrive without one, since a
-WebSocket message is already delimited.
+The shape is asymmetric in two ways, and both matter:
+
+* **Only requests carry the 4-byte length prefix.** A client wraps every
+  outgoing message in the same prefix the TCP transport uses and the node
+  strips it (`Ws::handle_connection`); the node's own frames arrive without
+  one, because a WebSocket message is already delimited.
+
+* **Only the node's frames carry a TAG byte.** A response is `0x02`, an update
+  `0x01` — but a request has none. The node strips the length prefix and hands
+  the remainder straight to `decode_request_body`, which reads
+  `lp(signature)` from byte zero. A tag byte here shifts every field by one and
+  the node cannot parse the frame at all: it rejects it with "lp field too
+  large: 50331648", which is `0x03000000` — the tag and the first three bytes
+  of the signature's length, read as one number. Nothing answers, and a bridge
+  that sent one sat in a connect / 30-second-timeout / reconnect loop forever
+  with an empty error, because that is what `asyncio.wait_for` raises.
+
+  `framing.rs` does define tagged request frames — for FEDERATION, between
+  nodes. The client transport is the untagged one. Do not "restore" the tag.
 
 The bridge is an anonymous client — it signs nothing — so `signature` and
 `userId` are empty on every request. Its authority is the bearer token inside
@@ -24,9 +37,9 @@ from __future__ import annotations
 import struct
 from typing import Tuple
 
+#: Tags the NODE puts on the frames it sends. A request carries none.
 TAG_UPDATE = 0x01
 TAG_RESPONSE = 0x02
-TAG_REQUEST = 0x03
 
 #: Single byte a client sends back to acknowledge a delivered response frame.
 #: The node holds the next response until it arrives.
@@ -44,10 +57,13 @@ def _lp_str(value: str) -> bytes:
 
 
 def encode_request(path: str, packet_id: str, payload: bytes) -> bytes:
-    """Encode one anonymous request, length-prefixed and ready to send."""
+    """Encode one anonymous request, length-prefixed and ready to send.
+
+    No tag byte: the node's client transport does not expect one on a request.
+    See the module docstring for what happens when there is one.
+    """
     body = (
-        bytes([TAG_REQUEST])
-        + _lp_str("")  # signature: the bridge holds no key
+        _lp_str("")  # signature: the bridge holds no key
         + _lp_str("")  # userId: it is not a Caspar user
         + _lp_str(path)
         + _lp_str(packet_id)

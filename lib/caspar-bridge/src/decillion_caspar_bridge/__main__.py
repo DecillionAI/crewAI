@@ -43,7 +43,11 @@ async def _run() -> int:
     # LLM is built against its base URL: the sandbox holds no provider key, and
     # every model call goes back out through the bridge to the `llm` creature,
     # which makes the real call and counts what it cost.
-    llm_proxy = LlmProxyServer(send, port=config.llm_proxy_port)
+    async def call_creature(action: str, payload: dict) -> dict:
+        assert client is not None
+        return await client.call_creature(action, payload)
+
+    llm_proxy = LlmProxyServer(call_creature, port=config.llm_proxy_port)
     await llm_proxy.start()
 
     runtime = CrewRuntime(config.space_id, send, llm_proxy)
@@ -72,6 +76,16 @@ async def _run() -> int:
                     },
                 },
             )
+            return
+        if key == "creature/result":
+            # A creature answering a call this sandbox made. The gateway only
+            # acknowledged delivery, so this is where the answer actually
+            # arrives; the correlation id says which caller was waiting.
+            correlation_id = str(data.get("correlationId") or "")
+            if not correlation_id or not client.resolve_creature_call(
+                correlation_id, data.get("result")
+            ):
+                logger.debug("no caller waiting for %s", correlation_id or "(no id)")
             return
         if key == "crew/ping":
             # The creature is probing whether this project's runtime is

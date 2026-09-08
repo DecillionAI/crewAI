@@ -41,12 +41,16 @@ class LlmProxyServer:
 
     def __init__(
         self,
-        send: Callable[[str, dict], Awaitable[dict]],
+        call: Callable[[str, dict], Awaitable[dict]],
         *,
         port: int = 8788,
         action: str = DEFAULT_ACTION,
     ) -> None:
-        self._send = send
+        #: A REQUEST/RESPONSE call to a creature — not a send. The gateway
+        #: acknowledges delivery and returns; the completion comes back
+        #: separately, and this waits for it (see `CasparBridgeClient.
+        #: call_creature`).
+        self._call = call
         self._port = port
         self._action = action
         self._server: asyncio.AbstractServer | None = None
@@ -162,7 +166,7 @@ class LlmProxyServer:
         if body.get("stream"):
             request["stream"] = True
 
-        reply = await self._send(self._action, request)
+        reply = await self._call(self._action, request)
         result = reply.get("result") if isinstance(reply.get("result"), dict) else reply
         if not isinstance(result, dict):
             return 502, {"error": {"message": "the platform returned no response"}}

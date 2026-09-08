@@ -18,6 +18,7 @@ one closing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -41,6 +42,10 @@ _BACKOFF_CAP = 30.0
 #: node answers gateway actions from state, so this is generous, not tight.
 _REQUEST_TIMEOUT = 30.0
 
+#: How long to wait for a CREATURE's answer (see `call_creature`). This is a
+#: model call, not a state read: it is bounded by the vendor, not by the node.
+_CREATURE_CALL_TIMEOUT = 300.0
+
 
 class CasparBridgeClient:
     """A reconnecting client for the gateway subscription channel."""
@@ -50,6 +55,12 @@ class CasparBridgeClient:
         self._on_update = on_update
         self._socket: websockets.ClientConnection | None = None
         self._pending: dict[str, asyncio.Future] = {}
+        #: Callers waiting on a CREATURE's answer, keyed by the correlation id
+        #: their call carried. Distinct from `_pending`, which tracks the
+        #: node's own transport-level responses: the gateway acknowledges
+        #: delivery immediately, and the creature's answer arrives later as an
+        #: update on this project's topic.
+        self._creature_calls: dict[str, asyncio.Future] = {}
         self._connected = asyncio.Event()
         self._closing = False
 
@@ -69,13 +80,30 @@ class CasparBridgeClient:
                     self._socket = socket
                     logger.info("connected to %s", self._config.gateway_url)
                     backoff = _BACKOFF_START
-                    await self._subscribe()
-                    self._connected.set()
-                    await self._read_loop(socket)
+                    # The reader must be running BEFORE the first request.
+                    # `_subscribe` waits for a response, and the only thing that
+                    # delivers one is `_read_loop` — so awaiting subscribe first
+                    # waits for a reply nobody is listening for. It timed out
+                    # after `_REQUEST_TIMEOUT`, every time, and the bridge sat in
+                    # a connect / 30s / reconnect loop that never subscribed to
+                    # anything. A project's agents were simply unreachable.
+                    reader = asyncio.create_task(self._read_loop(socket))
+                    try:
+                        await self._subscribe()
+                        self._connected.set()
+                        await reader
+                    finally:
+                        reader.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await reader
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - any failure is a retry
-                logger.warning("caspar connection lost: %s", exc)
+                # `str()` on an asyncio.TimeoutError is empty, which is how this
+                # loop spent its life reporting "caspar connection lost: " and
+                # nothing else. Name the type when the message is blank.
+                detail = str(exc) or type(exc).__name__
+                logger.warning("caspar connection lost: %s", detail)
             finally:
                 self._connected.clear()
                 self._socket = None
@@ -137,6 +165,46 @@ class CasparBridgeClient:
                 "payload": payload,
             },
         )
+
+    async def call_creature(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        timeout: float = _CREATURE_CALL_TIMEOUT,
+    ) -> dict:
+        """Call a creature action and wait for its ANSWER.
+
+        `signal` only tells you the node accepted the call: `/gateway/signal`
+        delivers and returns, and the caller is not a Caspar identity that
+        anything can signal back to. A creature that has something to say
+        publishes it on this project's topic under `creature/result`, tagged
+        with the correlation id generated here — which is what makes this a
+        request/response call rather than a send.
+
+        Without it, a caller reads the gateway's acknowledgement as though it
+        were the creature's reply: the model proxy did exactly that and
+        answered every completion with "the platform returned no completion".
+        """
+        correlation_id = uuid.uuid4().hex
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._creature_calls[correlation_id] = future
+        try:
+            ack = await self.signal(
+                action, {**payload, "correlationId": correlation_id}, correlation_id
+            )
+            if isinstance(ack, dict) and ack.get("ok") is False:
+                raise RuntimeError(f"{action} was refused: {ack.get('error') or ack}")
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            self._creature_calls.pop(correlation_id, None)
+
+    def resolve_creature_call(self, correlation_id: str, result: Any) -> bool:
+        """Hand a creature's answer to the call waiting for it."""
+        future = self._creature_calls.get(correlation_id)
+        if future is None or future.done():
+            return False
+        future.set_result(result if isinstance(result, dict) else {"result": result})
+        return True
 
     async def call(self, path: str, payload: dict[str, Any]) -> dict:
         socket = self._socket
@@ -205,7 +273,11 @@ class CasparBridgeClient:
         future.set_result(body if isinstance(body, dict) else {"result": body})
 
     def _fail_pending(self, reason: str) -> None:
-        for future in list(self._pending.values()):
-            if not future.done():
-                future.set_exception(RuntimeError(reason))
-        self._pending.clear()
+        # Both tables: a creature's answer comes back over this connection too,
+        # so a caller waiting on one must not wait out its whole timeout after
+        # the socket has gone.
+        for table in (self._pending, self._creature_calls):
+            for future in list(table.values()):
+                if not future.done():
+                    future.set_exception(RuntimeError(reason))
+            table.clear()

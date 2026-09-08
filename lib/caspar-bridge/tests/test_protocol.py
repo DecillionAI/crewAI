@@ -6,22 +6,41 @@ import pytest
 
 from decillion_caspar_bridge.protocol import (
     ACK_FRAME,
-    TAG_REQUEST,
     decode_frame,
     encode_request,
 )
 
 
-def test_request_is_length_prefixed_and_anonymous():
-    frame = encode_request("/gateway/subscribe", "pkt1", b'{"token":"t"}')
+def _read_lp(body, pos):
+    size = struct.unpack(">I", body[pos : pos + 4])[0]
+    return body[pos + 4 : pos + 4 + size], pos + 4 + size
+
+
+def test_a_request_carries_no_tag_byte():
+    """Decode a request the way the NODE decodes it.
+
+    `Ws::handle_connection` strips the 4-byte length prefix and hands the rest
+    to `decode_request_body`, which reads `lp(signature)` from byte zero. This
+    walks the frame the same way, so a tag byte — or any other extra byte —
+    fails here instead of on the wire, where it showed up only as the node
+    refusing to parse and the bridge reconnecting forever.
+    """
+    payload = b'{"token":"t"}'
+    frame = encode_request("/gateway/subscribe", "pkt1", payload)
     declared = struct.unpack(">I", frame[:4])[0]
     assert declared == len(frame) - 4
+
     body = frame[4:]
-    assert body[0] == TAG_REQUEST
-    # signature and userId are both empty: the bridge holds no key, and its
-    # authority is the token inside the payload.
-    assert struct.unpack(">I", body[1:5])[0] == 0
-    assert struct.unpack(">I", body[5:9])[0] == 0
+    signature, pos = _read_lp(body, 0)
+    user_id, pos = _read_lp(body, pos)
+    path, pos = _read_lp(body, pos)
+    packet_id, pos = _read_lp(body, pos)
+    # The bridge holds no key; its authority is the token inside the payload.
+    assert signature == b""
+    assert user_id == b""
+    assert path == b"/gateway/subscribe"
+    assert packet_id == b"pkt1"
+    assert body[pos:] == payload
 
 
 def test_decodes_a_response_frame():
