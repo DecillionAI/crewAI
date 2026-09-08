@@ -31,7 +31,8 @@ from collections import deque
 from typing import Any
 
 from .events import CrewEventForwarder
-from .roster import build_roster
+from .roster import as_manager, build_roster
+from .tools import build_tools
 
 logger = logging.getLogger(__name__)
 
@@ -91,15 +92,52 @@ def _lead_of(specs: list[dict[str, Any]], roster: dict[str, Any]) -> str:
     return ""
 
 
+def _asking_agent(message: dict[str, Any], specs: list[dict[str, Any]]) -> dict[str, str]:
+    """Who a question from this turn is attributed to.
+
+    A question is a thing an agent SAYS, so it needs an author — and the tools
+    are built before the crew is, because the crew is built WITH them, so the
+    agent that will actually run cannot be asked yet. The addressed agent is the
+    right answer whenever there is one; a prompt addressed to the project as a
+    whole is the lead's, and a project with no lead falls back to the first
+    agent on it. An empty author is refused by the creature rather than posted
+    as a message from nobody.
+    """
+    program_id = str(message.get("agentProgramId") or "").strip()
+    name = ""
+    by_id = {str(s.get("programId") or ""): s for s in specs}
+    if not program_id:
+        for spec in specs:
+            if spec.get("lead") is True and spec.get("programId"):
+                program_id = str(spec["programId"])
+                break
+    if not program_id and specs:
+        program_id = str(specs[0].get("programId") or "")
+    if spec := by_id.get(program_id):
+        name = str(spec.get("name") or "")
+    return {"agentProgramId": program_id, "agentName": name}
+
+
 class CrewRuntime:
     """Runs one project's crew, and remembers what it did."""
 
-    def __init__(self, space_id: str, send: Any, llm_proxy: Any = None) -> None:
+    def __init__(
+        self,
+        space_id: str,
+        send: Any,
+        llm_proxy: Any = None,
+        call: Any = None,
+    ) -> None:
         self._space_id = space_id
         #: The platform's model proxy, if this runtime has one. Agents are
         #: pointed at it instead of at a provider, so no key is in this
         #: sandbox and the platform counts the tokens itself.
         self._llm_proxy = llm_proxy
+        #: `call(action, payload)` — a REQUEST/RESPONSE call to a creature, as
+        #: opposed to `send`, which only posts. It is how an agent reaches the
+        #: project's Caspar tools: the tool is a creature on the node, and this
+        #: is the only channel out of the sandbox.
+        self._call = call
         #: `send(action, payload)` — the bridge's outbound call to the crew
         #: creature. Injected rather than imported so the runtime can be
         #: exercised without a socket.
@@ -161,10 +199,30 @@ class CrewRuntime:
                     str(spec_llm.get("provider") or "").strip().lower(),
                 )
             proxy_base_url = self._llm_proxy.base_url
+        # What the agents on this turn can actually do. Built per turn because
+        # the project's tool set travels with the prompt — a tool attached a
+        # second ago is usable on the very next run, exactly like an agent added
+        # a second ago is on the team.
+        #
+        # On a WORKER THREAD, because building the catalogue can install
+        # packages: doing that on the event loop would stop the socket, and with
+        # it every other project message, for as long as pip takes. Normally the
+        # catalogue is already warm (see `warm_catalog`) and this returns at
+        # once.
+        loop = asyncio.get_running_loop()
+        turn = {
+            "runId": run_id,
+            "threadId": thread_id,
+            **_asking_agent(message, specs),
+        }
+        tools = await loop.run_in_executor(
+            None, build_tools, list(message.get("tools") or []), self._call, loop, turn
+        )
         roster = build_roster(
             specs,
             str(message.get("universalPrompt") or ""),
             proxy_base_url,
+            tools,
         )
         if not roster:
             await self._post(
@@ -319,7 +377,14 @@ class CrewRuntime:
         reach that agent and nobody else.
         """
         if lead_id:
-            manager = roster[lead_id]
+            # The manager carries NO tools, and CrewAI enforces it ("Manager
+            # agent should not have tools"). The rule is right: in a
+            # hierarchical crew the manager decides who does the work and the
+            # teammates do it, so a manager holding tools would be a manager
+            # doing the job itself — which is the one thing delegation is for.
+            # Its teammates keep every tool; `as_manager` is what gives them up,
+            # and what tells the lead so.
+            manager = as_manager(roster[lead_id])
             teammates = [agent for pid, agent in roster.items() if pid != lead_id]
             goal = str(
                 by_id.get(lead_id, {}).get("goal")
@@ -335,12 +400,14 @@ class CrewRuntime:
                     manager_agent=manager,
                     verbose=False,
                 )
-            # A lead with nobody to lead is just an agent. Running it as a
+            # A lead with nobody to lead is just an agent, and it does the work
+            # itself — so this one runs WITH its tools. Running it as a
             # hierarchical crew with an empty roster would fail validation, and
             # the person asked for the work either way.
+            solo = roster[lead_id]
             return Crew(
-                agents=[manager],
-                tasks=[Task(description=prompt, expected_output=goal, agent=manager)],
+                agents=[solo],
+                tasks=[Task(description=prompt, expected_output=goal, agent=solo)],
                 process=Process.sequential,
                 verbose=False,
             )

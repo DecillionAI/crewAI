@@ -151,8 +151,28 @@ def _specs():
     ]
 
 
+class _FakeAgent:
+    """Enough of a CrewAI agent to see which of them keep their tools."""
+
+    def __init__(self, name, tools=("write_project_file",)):
+        self.name = name
+        self.tools = list(tools)
+
+    backstory = ""
+
+    def model_copy(self, update=None):
+        clone = _FakeAgent(self.name, self.tools)
+        clone.backstory = self.backstory
+        for key, value in (update or {}).items():
+            setattr(clone, key, value)
+        return clone
+
+    def __repr__(self):  # pragma: no cover - test output only
+        return f"<{self.name} tools={self.tools}>"
+
+
 def _roster():
-    return {"lead-1": "LEAD", "eng-1": "ENG", "des-1": "DES"}
+    return {"lead-1": _FakeAgent("LEAD"), "eng-1": _FakeAgent("ENG"), "des-1": _FakeAgent("DES")}
 
 
 def _build(selected, lead_id):
@@ -168,36 +188,46 @@ def test_the_lead_runs_the_whole_crew_as_its_manager():
     # One task for the objective, and the lead is the manager rather than one
     # more worker — that is what makes this collaboration and not a broadcast.
     assert crew.process == _FakeProcess.hierarchical
-    assert crew.manager_agent == "LEAD"
-    assert set(crew.agents) == {"ENG", "DES"}
+    assert crew.manager_agent.name == "LEAD"
+    assert {a.name for a in crew.agents} == {"ENG", "DES"}
     assert len(crew.tasks) == 1
     # CrewAI refuses a manager that is also in `agents`, and a hierarchical task
     # must leave the executor to the manager.
-    assert "LEAD" not in crew.agents
+    assert "LEAD" not in {a.name for a in crew.agents}
     assert crew.tasks[0].agent is None
     assert crew.tasks[0].description == "ship the thing"
+    # And the manager holds NO tools. CrewAI refuses one that does, because a
+    # manager with tools is a manager doing the work itself — while every
+    # teammate it delegates to keeps them.
+    assert crew.manager_agent.tools == []
+    assert all(a.tools for a in crew.agents)
 
 
 def test_mentioning_one_agent_still_addresses_only_that_agent():
     crew = _build(["eng-1"], "")
     assert crew.process == _FakeProcess.sequential
-    assert crew.agents == ["ENG"]
+    assert [a.name for a in crew.agents] == ["ENG"]
     assert len(crew.tasks) == 1
-    assert crew.tasks[0].agent == "ENG"
+    assert crew.tasks[0].agent.name == "ENG"
     assert crew.tasks[0].expected_output == "write code"
+    # It is doing the work, so it has the tools to do it.
+    assert crew.tasks[0].agent.tools
 
 
 def test_a_lead_with_no_teammates_answers_by_itself():
     by_id = {s["programId"]: s for s in _specs()}
     crew = CrewRuntime._build_crew(
-        "ship the thing", {"lead-1": "LEAD"}, ["lead-1"], by_id, "lead-1",
+        "ship the thing", {"lead-1": _FakeAgent("LEAD")}, ["lead-1"], by_id, "lead-1",
         _FakeCrew, _FakeProcess, _FakeTask,
     )
     # A hierarchical crew with nobody to delegate to fails validation, and the
     # person asked for the work either way.
     assert crew.process == _FakeProcess.sequential
-    assert crew.agents == ["LEAD"]
-    assert crew.tasks[0].agent == "LEAD"
+    assert [a.name for a in crew.agents] == ["LEAD"]
+    assert crew.tasks[0].agent.name == "LEAD"
+    # Nobody to delegate to means it does the work, so it keeps its tools —
+    # the manager's empty toolset is a property of managing, not of being lead.
+    assert crew.tasks[0].agent.tools
 
 
 def test_the_lead_is_the_one_the_platform_marked():
@@ -335,3 +365,24 @@ def test_a_step_with_no_named_agent_claims_none():
         "started", None
     )
     assert "agentName" not in seen[0][1]
+
+
+def test_a_question_is_attributed_to_the_agent_that_was_addressed():
+    from decillion_caspar_bridge.runtime import _asking_agent
+
+    specs = [
+        {"programId": "lead-1", "lead": True, "name": "Orbit Lead"},
+        {"programId": "eng-1", "lead": False, "name": "Engineer"},
+    ]
+    # Addressed directly: that agent asks.
+    assert _asking_agent({"agentProgramId": "eng-1"}, specs) == {
+        "agentProgramId": "eng-1",
+        "agentName": "Engineer",
+    }
+    # Addressed to the project: the lead speaks for it.
+    assert _asking_agent({}, specs)["agentProgramId"] == "lead-1"
+    # No lead: the first agent on the project.
+    assert _asking_agent({}, [{"programId": "eng-1", "name": "Engineer"}])["agentProgramId"] == "eng-1"
+    # Nobody at all: empty, which the creature refuses rather than posting a
+    # message from no one.
+    assert _asking_agent({}, [])["agentProgramId"] == ""

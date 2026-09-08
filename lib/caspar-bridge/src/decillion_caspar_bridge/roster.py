@@ -84,6 +84,53 @@ def llm_kwargs(llm: dict[str, Any] | None, proxy_base_url: str) -> dict[str, Any
     return {"api_key": PROXY_API_KEY, "base_url": proxy_base_url}
 
 
+#: Told to every agent that has tools. Deliberately about consequences rather
+#: than instructions — a model follows "this is what is real" better than "you
+#: must", and the point is genuinely a fact about the platform.
+_TOOL_PREAMBLE = (
+    "You are working on this project's own machine, and you have tools that act on it. "
+    "The project folder is where the project's files live: what you write there is what "
+    "your teammates see, what the people on this project open in the Files panel, and "
+    "what survives after this conversation. Text in an answer is not a delivered file. "
+    "When the work you were asked for IS a file — a document, a script, a report — write "
+    "it with your file tools and then say where you put it. When you need a fact about "
+    "the project, read it with your tools rather than assuming it."
+)
+
+
+#: Told to the lead when it runs a crew as its MANAGER.
+#:
+#: CrewAI forbids a manager_agent from holding tools — it delegates, it does not
+#: execute — so the lead in a led turn genuinely has none, and telling it
+#: otherwise is how it ends a turn by asking a question nothing is listening
+#: for. That is not hypothetical: a lead asked "Formal or Playful?" as its final
+#: answer, because it had been told it could ask and had no tool to ask with.
+_MANAGER_PREAMBLE = (
+    "You are leading this project's crew. You do not use tools yourself — your "
+    "teammates do the work, and they have every tool this project has: its files, its "
+    "machine, its connected accounts, and the ability to ask the people on this "
+    "project a question and wait for their answer. So delegate the work, and when a "
+    "decision is the project's to make, delegate the ASKING too: tell a teammate to "
+    "use ask_the_project and report back what they were told. Never end your turn by "
+    "asking a question yourself — your turn is the answer, and nobody is waiting to "
+    "reply to it."
+)
+
+
+def as_manager(agent: "Agent") -> "Agent":
+    """The same agent, prepared to run a crew rather than to work in one.
+
+    Two things change together, and they have to: a manager holds no tools (the
+    framework refuses one that does), and it must not be told that it has any.
+    The tools preamble is swapped for the manager's rather than removed, because
+    an agent that is simply told nothing about tools reaches for them anyway.
+    """
+    story = str(getattr(agent, "backstory", "") or "")
+    if _TOOL_PREAMBLE in story:
+        story = story.replace(_TOOL_PREAMBLE, _MANAGER_PREAMBLE)
+    return agent.model_copy(update={"tools": [], "backstory": story})
+
+
 def build_agent(
     spec: dict[str, Any],
     universal_prompt: str,
@@ -103,6 +150,21 @@ def build_agent(
     from crewai import LLM, Agent
 
     backstory = str(spec.get("backstory") or spec.get("instruction") or "").strip()
+    if tools:
+        # What having tools MEANS here, said once.
+        #
+        # A model asked to "create a file" will happily answer with the file's
+        # contents and consider the job done — which is precisely the failure
+        # this platform kept hitting: an agent reported saving a document that
+        # was never written, and the project's Files panel stayed empty. Having
+        # the tool is not enough; the agent has to know that the tool is what
+        # counts as delivery.
+        #
+        # It sits between the platform's instruction and the agent's own voice,
+        # because it describes the workplace rather than the work: it is true of
+        # every agent on every project, and it must not be the last thing the
+        # model reads.
+        backstory = f"{_TOOL_PREAMBLE}\n\n{backstory}".strip()
     if universal_prompt:
         backstory = f"{universal_prompt.strip()}\n\n{backstory}".strip()
 
@@ -134,12 +196,20 @@ def build_roster(
     specs: list[dict[str, Any]],
     universal_prompt: str,
     proxy_base_url: str,
+    tools: list[Any] | None = None,
 ) -> dict[str, "Agent"]:
     """Every agent on the project, keyed by its Decillion program id.
 
     The program id is the identity everything else uses — it is what a mention
     resolves to and what a message is attributed to — so it is the key here
     too.
+
+    Every agent gets the SAME tools, and deliberately: they are the project's
+    tools, not the agent's. The project's files, its machine and its connected
+    accounts belong to the space, so which of them an agent may touch is a
+    property of the project rather than of the listing somebody published to the
+    market. What differs between two agents is the instruction that tells them
+    what to do with the tools, which is exactly where the difference belongs.
     """
     roster: dict[str, "Agent"] = {}
     for spec in specs:
@@ -147,7 +217,7 @@ def build_roster(
         if not program_id:
             continue
         try:
-            roster[program_id] = build_agent(spec, universal_prompt, proxy_base_url)
+            roster[program_id] = build_agent(spec, universal_prompt, proxy_base_url, tools)
         except Exception:  # noqa: BLE001 - one bad listing must not empty the team
             logger.exception("skipping agent %s: could not be built", program_id)
     return roster

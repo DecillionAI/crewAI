@@ -16,6 +16,7 @@ from .client import CasparBridgeClient
 from .config import load_config
 from .llm_proxy import LlmProxyServer
 from .runtime import CrewRuntime
+from .tools import warm_catalog
 
 logger = logging.getLogger("decillion_caspar_bridge")
 
@@ -50,7 +51,7 @@ async def _run() -> int:
     llm_proxy = LlmProxyServer(call_creature, port=config.llm_proxy_port)
     await llm_proxy.start()
 
-    runtime = CrewRuntime(config.space_id, send, llm_proxy)
+    runtime = CrewRuntime(config.space_id, send, llm_proxy, call_creature)
 
     async def on_update(key: str, data: dict) -> None:
         """Everything the project's creatures push to this bridge."""
@@ -115,7 +116,22 @@ async def _run() -> int:
             except Exception:  # noqa: BLE001 - readiness is reported, not required
                 logger.exception("could not announce readiness")
 
+    async def warm_tools() -> None:
+        """Build the tool catalogue before anyone prompts.
+
+        Constructing it accepts the catalogue's own install prompts, so the
+        first build genuinely installs packages and takes minutes. That cost is
+        paid here, on a worker thread while the bridge is otherwise idle, rather
+        than inside whichever prompt happened to arrive first.
+        """
+        try:
+            count = await asyncio.to_thread(warm_catalog)
+            logger.info("tool catalogue ready: %d tools", count)
+        except Exception:  # noqa: BLE001 - the catalogue is a bonus, not the runtime
+            logger.exception("could not build the tool catalogue")
+
     asyncio.create_task(announce())
+    asyncio.create_task(warm_tools())
 
     await stop.wait()
     logger.info("shutting down")
