@@ -198,6 +198,24 @@ class CasparBridgeClient:
         finally:
             self._creature_calls.pop(correlation_id, None)
 
+    async def await_creature_result(self, correlation_id: str, timeout: float) -> Any:
+        """Wait for a result published under an id this client did not mint.
+
+        `call_creature` covers the ordinary case: ask, and wait for the answer
+        to that call. Some answers arrive under a DIFFERENT id, because they
+        come from somewhere else entirely — a question is answered by a person,
+        minutes later, and the creature says up front which id that answer will
+        carry. Waiting on it is the same machinery, entered from the other end.
+        """
+        if not correlation_id:
+            raise ValueError("a correlation id is required to wait for a result")
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._creature_calls[correlation_id] = future
+        try:
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            self._creature_calls.pop(correlation_id, None)
+
     def resolve_creature_call(self, correlation_id: str, result: Any) -> bool:
         """Hand a creature's answer to the call waiting for it."""
         future = self._creature_calls.get(correlation_id)

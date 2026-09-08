@@ -127,6 +127,7 @@ class CrewRuntime:
         send: Any,
         llm_proxy: Any = None,
         call: Any = None,
+        await_result: Any = None,
     ) -> None:
         self._space_id = space_id
         #: The platform's model proxy, if this runtime has one. Agents are
@@ -138,6 +139,11 @@ class CrewRuntime:
         #: project's Caspar tools: the tool is a creature on the node, and this
         #: is the only channel out of the sandbox.
         self._call = call
+        #: `await_result(correlationId, timeout)` — wait for something published
+        #: under an id this process did not mint. A question's answer comes from
+        #: a person, long after the call that asked it returned, so the creature
+        #: names the id up front and this is what waits on it.
+        self._await_result = await_result
         #: `send(action, payload)` — the bridge's outbound call to the crew
         #: creature. Injected rather than imported so the runtime can be
         #: exercised without a socket.
@@ -210,13 +216,24 @@ class CrewRuntime:
         # catalogue is already warm (see `warm_catalog`) and this returns at
         # once.
         loop = asyncio.get_running_loop()
-        turn = {
-            "runId": run_id,
-            "threadId": thread_id,
-            **_asking_agent(message, specs),
-        }
+        # The question tool is offered only when this project can actually
+        # deliver a question. That is a property of the machine's grant — fixed
+        # when it was provisioned — so the platform is what says whether it is
+        # routable, and a project provisioned before questions existed gets
+        # agents that do not reach for one.
+        turn = (
+            {"runId": run_id, "threadId": thread_id, **_asking_agent(message, specs)}
+            if message.get("canAsk") is True
+            else None
+        )
         tools = await loop.run_in_executor(
-            None, build_tools, list(message.get("tools") or []), self._call, loop, turn
+            None,
+            build_tools,
+            list(message.get("tools") or []),
+            self._call,
+            loop,
+            turn,
+            self._await_result,
         )
         roster = build_roster(
             specs,

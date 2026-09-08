@@ -48,10 +48,14 @@ async def _run() -> int:
         assert client is not None
         return await client.call_creature(action, payload)
 
+    async def await_result(correlation_id: str, timeout: float) -> dict:
+        assert client is not None
+        return await client.await_creature_result(correlation_id, timeout)
+
     llm_proxy = LlmProxyServer(call_creature, port=config.llm_proxy_port)
     await llm_proxy.start()
 
-    runtime = CrewRuntime(config.space_id, send, llm_proxy, call_creature)
+    runtime = CrewRuntime(config.space_id, send, llm_proxy, call_creature, await_result)
 
     async def on_update(key: str, data: dict) -> None:
         """Everything the project's creatures push to this bridge."""

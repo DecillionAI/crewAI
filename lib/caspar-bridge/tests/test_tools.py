@@ -237,3 +237,76 @@ def test_the_install_target_is_set_up_and_put_back(tmp_path, monkeypatch):
 
     assert os.getcwd() == before
     assert "UV_PROJECT_ENVIRONMENT" not in os.environ
+
+
+def test_the_question_tool_needs_somewhere_to_send_the_answer():
+    """Without a way to WAIT for an answer there is no question tool.
+
+    The answer arrives under an id the creature names, long after the call that
+    asked returned — so a runtime with no `await_result` cannot receive one, and
+    offering the tool would hang the agent instead of answering it.
+    """
+
+    async def call(action, payload):  # pragma: no cover - never reached
+        return {}
+
+    assert tools.build_tools([], call, None, {"runId": "r-1"}) == []
+    assert tools.build_tools([], call, None, {"runId": "r-1"}, None) == []
+
+
+# ── asking the project ───────────────────────────────────────────────────────
+
+
+def _timeout():
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    raise FuturesTimeout()
+
+
+def test_a_question_that_never_reaches_the_project_says_so_at_once():
+    """The failure the split exists for.
+
+    An unrouted action is delivered to the grant's default handler, which records
+    something and never replies — so the accept never lands. That used to be a
+    quarter of an hour of silence mid-run; it is now an answer the agent can act
+    on straight away.
+    """
+    out = tools.ask_question(_timeout, lambda answer_id: pytest.fail("must not wait"))
+    assert "did not accept the question" in out
+    assert "Continue without asking" in out
+
+
+def test_a_question_nobody_answers_lets_the_run_finish():
+    """Different from the above, and it must read differently.
+
+    Nobody answering is ordinary — a project with nobody watching — so the agent
+    is told to decide and to say that it was unconfirmed, rather than that
+    something is broken.
+    """
+    out = tools.ask_question(lambda: {"ok": True, "answerId": "a-1"}, lambda _id: _timeout())
+    assert "Nobody answered in time" in out
+    assert "best judgement" in out
+
+
+def test_an_answer_comes_back_to_the_agent():
+    seen = {}
+
+    def wait_for(answer_id):
+        seen["id"] = answer_id
+        return {"ok": True, "answer": "Playful"}
+
+    out = tools.ask_question(lambda: {"ok": True, "answerId": "a-42"}, wait_for)
+    # It waits on the id the CREATURE named, not on the one the call used.
+    assert seen["id"] == "a-42"
+    assert out == "The project answered: Playful"
+
+
+def test_a_refused_question_reports_the_reason():
+    out = tools.ask_question(lambda: {"ok": False, "error": "not a member"}, lambda _id: {})
+    assert "not a member" in out
+
+
+def test_an_acceptance_with_no_answer_id_is_not_waited_on():
+    """Without an id there is nothing to wait for, and waiting anyway hangs."""
+    out = tools.ask_question(lambda: {"ok": True}, lambda _id: pytest.fail("must not wait"))
+    assert "could not register the question" in out

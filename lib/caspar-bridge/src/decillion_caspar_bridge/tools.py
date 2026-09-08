@@ -424,6 +424,13 @@ def _render(result: dict[str, Any]) -> str:
 #: instead of holding an agent — and its authorization — open indefinitely.
 QUESTION_TIMEOUT_SECONDS = float(os.environ.get("DECILLION_QUESTION_TIMEOUT", "900"))
 
+#: How long to wait for the platform to ACCEPT a question, as opposed to answer
+#: it. Short, because this leg involves no person: the creature records the
+#: question and says so. It exists to separate "nobody has answered yet" from
+#: "the question never reached the project at all" — two situations that look
+#: identical from inside an agent and want opposite responses.
+QUESTION_ACCEPT_SECONDS = 45.0
+
 #: How many questions one turn may ask. A run that asks endlessly is worse than
 #: one that guesses: every question stops the work and costs somebody's
 #: attention. Past this the tool tells the agent to decide for itself.
@@ -432,6 +439,7 @@ MAX_QUESTIONS_PER_RUN = 4
 
 def ask_tool(
     call: Callable[[str, dict], Awaitable[dict]],
+    await_result: Callable[[str, float], Awaitable[Any]],
     loop: asyncio.AbstractEventLoop,
     run_id: str,
     thread_id: str,
@@ -495,29 +503,78 @@ def ask_tool(
                 "agentProgramId": agent_program_id,
                 "agentName": agent_name,
             }
-            try:
-                future = asyncio.run_coroutine_threadsafe(call("crew/ask", payload), loop)
-                result = future.result(timeout=QUESTION_TIMEOUT_SECONDS)
-            except FuturesTimeout:
-                # Not an error: a project nobody is watching is an ordinary
-                # situation, and the run should finish rather than hold its
-                # authorization open until something else times it out.
-                return (
-                    "Nobody answered in time. Continue with your best judgement, and say "
-                    "in your answer what you decided and that it was unconfirmed."
-                )
-            except Exception as exc:  # noqa: BLE001 - a failed ask is an answer
-                logger.exception("could not ask the project")
-                return f"Error: the question could not be put to the project: {exc}"
-            if isinstance(result, dict):
-                if result.get("ok") is False:
-                    return f"Error: {result.get('error') or 'the question was refused'}"
-                answer = str(result.get("answer") or "").strip()
-                if answer:
-                    return f"The project answered: {answer}"
-            return "The project gave no answer. Continue with your best judgement."
+            return ask_question(
+                lambda: asyncio.run_coroutine_threadsafe(
+                    call("crew/ask", payload), loop
+                ).result(timeout=QUESTION_ACCEPT_SECONDS),
+                lambda answer_id: asyncio.run_coroutine_threadsafe(
+                    await_result(answer_id, QUESTION_TIMEOUT_SECONDS), loop
+                ).result(timeout=QUESTION_TIMEOUT_SECONDS + 30),
+            )
 
     return AskTheProject()
+
+
+def ask_question(submit: Callable[[], Any], wait_for: Callable[[str], Any]) -> str:
+    """Put a question to the project and report what came back.
+
+    TWO waits, and the split is the point.
+    The first is the platform ACCEPTING the question — no person is involved, so
+    it is quick, and it either returns the id the answer will arrive under or it
+    fails. The second is the person.
+
+    Before this was split, a question that never reached the project at all was
+    indistinguishable from one nobody had answered yet: both were a quarter of an
+    hour of silence in the middle of a run, with nothing in the project to show a
+    question had been asked. That is exactly what a missing route did — the
+    gateway delivers an unrouted action to the grant's default handler, which
+    records something and never replies.
+
+    Every outcome is a STRING the agent can act on. A tool that raises here would
+    end the turn; the point of asking is to carry on.
+    """
+    try:
+        accepted = submit()
+    except FuturesTimeout:
+        return (
+            "Error: this project did not accept the question — its runtime may not "
+            "be able to reach the platform's question handler. Continue without "
+            "asking, and say in your answer what you decided without confirmation."
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed ask is an answer
+        logger.exception("could not ask the project")
+        return f"Error: the question could not be put to the project: {exc}"
+
+    if not isinstance(accepted, dict) or accepted.get("ok") is False:
+        reason = (accepted or {}).get("error") if isinstance(accepted, dict) else ""
+        return f"Error: {reason or 'the question was refused by the project'}"
+    answer_id = str(accepted.get("answerId") or "")
+    if not answer_id:
+        return (
+            "Error: this project could not register the question. Continue without "
+            "asking, and say what you decided without confirmation."
+        )
+
+    try:
+        result = wait_for(answer_id)
+    except FuturesTimeout:
+        # Not an error: a project nobody is watching is an ordinary
+        # situation, and the run should finish rather than hold its
+        # authorization open until something else times it out.
+        return (
+            "Nobody answered in time. Continue with your best judgement, and say "
+            "in your answer what you decided and that it was unconfirmed."
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("waiting for an answer failed")
+        return f"Error: the answer never arrived: {exc}"
+    if isinstance(result, dict):
+        if result.get("ok") is False:
+            return f"Error: {result.get('error') or 'the question was refused'}"
+        answer = str(result.get("answer") or "").strip()
+        if answer:
+            return f"The project answered: {answer}"
+    return "The project gave no answer. Continue with your best judgement."
 
 
 # ── the CrewAI catalogue ─────────────────────────────────────────────────────
@@ -778,6 +835,7 @@ def build_tools(
     call: Callable[[str, dict], Awaitable[dict]] | None,
     loop: asyncio.AbstractEventLoop | None,
     turn: dict[str, str] | None = None,
+    await_result: Callable[[str, float], Awaitable[Any]] | None = None,
 ) -> list[Any]:
     """Everything the agents on this turn can use.
 
@@ -800,11 +858,12 @@ def build_tools(
             tools.extend(creature_tools(tool_specs, call, loop))
         except Exception:  # noqa: BLE001
             logger.exception("could not build the project's Caspar tools")
-        if turn:
+        if turn and await_result is not None:
             try:
                 tools.append(
                     ask_tool(
                         call,
+                        await_result,
                         loop,
                         turn.get("runId", ""),
                         turn.get("threadId", "main"),
