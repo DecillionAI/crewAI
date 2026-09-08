@@ -104,30 +104,48 @@ class CrewEventForwarder:
 
     def _step(self, state: str, task: Any, detail: Any = None) -> None:
         description = _text(getattr(task, "description", "")) if task else ""
-        self._emit(
-            "step",
-            {
-                "runId": self._run_id,
-                "agentProgramId": self._agent_program_id,
-                "status": state,
-                "text": description,
-                "data": {"detail": _text(detail)} if detail is not None else None,
-            },
-        )
+        payload = {
+            "runId": self._run_id,
+            "agentProgramId": self._agent_program_id,
+            "status": state,
+            "text": description,
+            "data": {"detail": _text(detail)} if detail is not None else None,
+        }
+        # Who actually did this. On a led turn the run belongs to the lead but
+        # the work is done by whichever teammate it delegated to, so without
+        # this the whole crew's trail reads as the lead doing everything.
+        if actor := _actor_of(task):
+            payload["agentName"] = actor
+        self._emit("step", payload)
 
     def _tool(self, state: str, event: Any) -> None:
-        self._emit(
-            "toolcall",
-            {
-                "runId": self._run_id,
-                "agentProgramId": self._agent_program_id,
-                "status": state,
-                "toolName": getattr(event, "tool_name", "") or "",
-                "toolArgs": _jsonable(getattr(event, "tool_args", None)),
-                "toolResult": _text(getattr(event, "output", None)),
-                "text": getattr(event, "tool_name", "") or "",
-            },
-        )
+        payload = {
+            "runId": self._run_id,
+            "agentProgramId": self._agent_program_id,
+            "status": state,
+            "toolName": getattr(event, "tool_name", "") or "",
+            "toolArgs": _jsonable(getattr(event, "tool_args", None)),
+            "toolResult": _text(getattr(event, "output", None)),
+            "text": getattr(event, "tool_name", "") or "",
+        }
+        if actor := _actor_of(getattr(event, "agent", None) or event):
+            payload["agentName"] = actor
+        self._emit("toolcall", payload)
+
+
+def _actor_of(source: Any) -> str:
+    """The role of the agent behind an event, when CrewAI names one.
+
+    A task carries the agent assigned to it; a tool event carries the agent that
+    called the tool. Both are read the same way, and an event that names neither
+    reports nothing rather than guessing — the run's own agent is already on
+    every payload.
+    """
+    if source is None:
+        return ""
+    agent = getattr(source, "agent", None) or source
+    role = getattr(agent, "role", None)
+    return role.strip() if isinstance(role, str) else ""
 
 
 def _text(value: Any) -> str:

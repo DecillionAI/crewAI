@@ -75,6 +75,22 @@ def _first_int(source: Any, names: tuple[str, ...]) -> int:
     return 0
 
 
+def _lead_of(specs: list[dict[str, Any]], roster: dict[str, Any]) -> str:
+    """The project's lead agent, if it has one and it can actually run.
+
+    The crew creature marks it (`lead: true` on the roster entry, decided from
+    the agent's `@lead` handle), so this is a lookup rather than a second place
+    that knows the naming convention. An agent that failed to build is not in
+    the roster, and a lead that cannot run must not silently swallow the turn.
+    """
+    for spec in specs:
+        if spec.get("lead") is True:
+            program_id = str(spec.get("programId") or "")
+            if program_id in roster:
+                return program_id
+    return ""
+
+
 class CrewRuntime:
     """Runs one project's crew, and remembers what it did."""
 
@@ -177,8 +193,20 @@ class CrewRuntime:
             )
             return
 
-        # Which agents this turn is for: the ones it addressed, else the whole
-        # team. Addressing nobody is how a project-wide prompt is expressed.
+        # Who this turn is for — and, more importantly, WHICH KIND of turn it
+        # is. A project has two entry points and they behave differently:
+        #
+        #   * the LEAD (`@lead`) is where a whole objective goes. The turn is
+        #     the crew's: the lead runs it as the crew's manager, decomposing
+        #     the work and delegating to whichever teammates it needs, and one
+        #     answer comes back under the lead's name.
+        #   * any OTHER agent, mentioned by name, is that agent's turn alone —
+        #     unchanged, and the reason both are worth having.
+        #
+        # Addressing nobody is a project-wide prompt, which is the lead's job
+        # when there is one; a project with no lead falls back to running the
+        # whole roster, as it always did.
+        lead_id = _lead_of(specs, roster)
         addressed = [
             str(m.get("programId") or m)
             for m in (message.get("mentions") or [])
@@ -188,7 +216,12 @@ class CrewRuntime:
         if target_id:
             addressed.append(target_id)
         selected = [pid for pid in dict.fromkeys(addressed) if pid in roster]
-        if not selected:
+        crew_turn = bool(lead_id) and (not selected or lead_id in selected)
+        if crew_turn:
+            # The lead owns the record and writes the answer; the teammates it
+            # delegates to report their work as steps under the same run.
+            selected = [lead_id]
+        elif not selected:
             selected = list(roster)
 
         started_at = time.time()
@@ -208,7 +241,14 @@ class CrewRuntime:
         async with self._semaphore:
             try:
                 output = await self._kickoff(
-                    prompt, roster, selected, specs, run_id, thread_id, usage
+                    prompt,
+                    roster,
+                    selected,
+                    specs,
+                    run_id,
+                    thread_id,
+                    usage,
+                    lead_id if crew_turn else "",
                 )
                 record["status"] = "done"
                 record["output"] = output
@@ -248,6 +288,81 @@ class CrewRuntime:
                     },
                 )
 
+    @staticmethod
+    def _build_crew(
+        prompt: str,
+        roster: dict[str, Any],
+        selected: list[str],
+        by_id: dict[str, Any],
+        lead_id: str,
+        Crew: Any,
+        Process: Any,
+        Task: Any,
+    ) -> Any:
+        """The crew that runs this turn.
+
+        Two shapes, because a project has two kinds of turn:
+
+        **Led.** The objective goes to the crew as ONE task with no agent on
+        it, and the lead is the crew's `manager_agent`. CrewAI's hierarchical
+        process is exactly this: the manager plans the work, delegates each
+        piece to the teammate best suited to it, and returns one result. That
+        is what makes `@lead` a collaboration rather than a broadcast — the
+        teammates are chosen by the lead, per step, from what the task needs.
+
+        CrewAI requires the manager to be outside `agents` and turns its
+        delegation on itself, so the teammates keep `allow_delegation=False`
+        and only the lead hands work out.
+
+        **Direct.** One task per addressed agent, run in order, each answering
+        as itself. Unchanged: mentioning an agent by name is still how you
+        reach that agent and nobody else.
+        """
+        if lead_id:
+            manager = roster[lead_id]
+            teammates = [agent for pid, agent in roster.items() if pid != lead_id]
+            goal = str(
+                by_id.get(lead_id, {}).get("goal")
+                or "A complete, useful result for the project."
+            )
+            if teammates:
+                return Crew(
+                    agents=teammates,
+                    # No `agent=`: in a hierarchical crew the manager decides
+                    # who executes, and pinning one here would defeat that.
+                    tasks=[Task(description=prompt, expected_output=goal)],
+                    process=Process.hierarchical,
+                    manager_agent=manager,
+                    verbose=False,
+                )
+            # A lead with nobody to lead is just an agent. Running it as a
+            # hierarchical crew with an empty roster would fail validation, and
+            # the person asked for the work either way.
+            return Crew(
+                agents=[manager],
+                tasks=[Task(description=prompt, expected_output=goal, agent=manager)],
+                process=Process.sequential,
+                verbose=False,
+            )
+
+        tasks = [
+            Task(
+                description=prompt,
+                expected_output=str(
+                    by_id.get(program_id, {}).get("goal")
+                    or "A complete, useful answer for the project."
+                ),
+                agent=roster[program_id],
+            )
+            for program_id in selected
+        ]
+        return Crew(
+            agents=[roster[pid] for pid in selected],
+            tasks=tasks,
+            process=Process.sequential,
+            verbose=False,
+        )
+
     async def _kickoff(
         self,
         prompt: str,
@@ -257,30 +372,12 @@ class CrewRuntime:
         run_id: str,
         thread_id: str,
         usage: dict[str, Any],
+        lead_id: str = "",
     ) -> str:
         from crewai import Crew, Process, Task
 
         by_id = {str(s.get("programId")): s for s in specs}
-        tasks = []
-        for program_id in selected:
-            spec = by_id.get(program_id, {})
-            tasks.append(
-                Task(
-                    description=prompt,
-                    expected_output=str(
-                        spec.get("goal")
-                        or "A complete, useful answer for the project."
-                    ),
-                    agent=roster[program_id],
-                )
-            )
-
-        crew = Crew(
-            agents=[roster[pid] for pid in selected],
-            tasks=tasks,
-            process=Process.sequential,
-            verbose=False,
-        )
+        crew = self._build_crew(prompt, roster, selected, by_id, lead_id, Crew, Process, Task)
 
         loop = asyncio.get_running_loop()
 

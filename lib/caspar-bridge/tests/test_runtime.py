@@ -113,3 +113,225 @@ def test_token_usage_is_read_from_whichever_shape_crewai_offers():
     # An unknown shape reports zero rather than raising: a renamed counter must
     # never stop a run from being recorded.
     assert _token_usage(object(), object()) == {"promptTokens": 0, "completionTokens": 0}
+
+
+# ── The two entry points ─────────────────────────────────────────────────────
+#
+# A project is reached in two ways and they must not collapse into one: `@lead`
+# hands a whole objective to the CREW, and any other `@agent` addresses that
+# agent alone. These exercise the decision without building a real crew — what
+# is under test is which agents a turn is for and how they are arranged, not
+# CrewAI itself.
+
+class _FakeProcess:
+    sequential = "sequential"
+    hierarchical = "hierarchical"
+
+
+class _FakeTask:
+    def __init__(self, description, expected_output, agent=None):
+        self.description = description
+        self.expected_output = expected_output
+        self.agent = agent
+
+
+class _FakeCrew:
+    def __init__(self, agents, tasks, process, verbose=False, manager_agent=None):
+        self.agents = agents
+        self.tasks = tasks
+        self.process = process
+        self.manager_agent = manager_agent
+
+
+def _specs():
+    return [
+        {"programId": "lead-1", "username": "lead", "lead": True, "goal": "run the project"},
+        {"programId": "eng-1", "username": "eng", "lead": False, "goal": "write code"},
+        {"programId": "des-1", "username": "des", "lead": False, "goal": "design"},
+    ]
+
+
+def _roster():
+    return {"lead-1": "LEAD", "eng-1": "ENG", "des-1": "DES"}
+
+
+def _build(selected, lead_id):
+    by_id = {s["programId"]: s for s in _specs()}
+    return CrewRuntime._build_crew(
+        "ship the thing", _roster(), selected, by_id, lead_id,
+        _FakeCrew, _FakeProcess, _FakeTask,
+    )
+
+
+def test_the_lead_runs_the_whole_crew_as_its_manager():
+    crew = _build(["lead-1"], "lead-1")
+    # One task for the objective, and the lead is the manager rather than one
+    # more worker — that is what makes this collaboration and not a broadcast.
+    assert crew.process == _FakeProcess.hierarchical
+    assert crew.manager_agent == "LEAD"
+    assert set(crew.agents) == {"ENG", "DES"}
+    assert len(crew.tasks) == 1
+    # CrewAI refuses a manager that is also in `agents`, and a hierarchical task
+    # must leave the executor to the manager.
+    assert "LEAD" not in crew.agents
+    assert crew.tasks[0].agent is None
+    assert crew.tasks[0].description == "ship the thing"
+
+
+def test_mentioning_one_agent_still_addresses_only_that_agent():
+    crew = _build(["eng-1"], "")
+    assert crew.process == _FakeProcess.sequential
+    assert crew.agents == ["ENG"]
+    assert len(crew.tasks) == 1
+    assert crew.tasks[0].agent == "ENG"
+    assert crew.tasks[0].expected_output == "write code"
+
+
+def test_a_lead_with_no_teammates_answers_by_itself():
+    by_id = {s["programId"]: s for s in _specs()}
+    crew = CrewRuntime._build_crew(
+        "ship the thing", {"lead-1": "LEAD"}, ["lead-1"], by_id, "lead-1",
+        _FakeCrew, _FakeProcess, _FakeTask,
+    )
+    # A hierarchical crew with nobody to delegate to fails validation, and the
+    # person asked for the work either way.
+    assert crew.process == _FakeProcess.sequential
+    assert crew.agents == ["LEAD"]
+    assert crew.tasks[0].agent == "LEAD"
+
+
+def test_the_lead_is_the_one_the_platform_marked():
+    from decillion_caspar_bridge.runtime import _lead_of
+
+    assert _lead_of(_specs(), _roster()) == "lead-1"
+    # An agent that failed to build is not in the roster, and a lead that cannot
+    # run must not silently swallow the turn.
+    assert _lead_of(_specs(), {"eng-1": "ENG"}) == ""
+    # No lead marked: every project that has none keeps working.
+    assert _lead_of([{"programId": "eng-1", "lead": False}], {"eng-1": "ENG"}) == ""
+
+
+def _selection(message, monkeypatch):
+    """Which agents a turn is for, and whether it is a crew turn.
+
+    `build_roster` and the crew run are replaced: what is under test is the
+    decision `handle_prompt` makes, and building a real crew would require
+    CrewAI and a model.
+    """
+    import decillion_caspar_bridge.runtime as rt
+
+    monkeypatch.setattr(
+        rt, "build_roster", lambda specs, *_a, **_k: {
+            str(s["programId"]): f"AGENT:{s['programId']}" for s in specs
+        }
+    )
+    seen = {}
+
+    async def fake_kickoff(self, prompt, roster, selected, specs, run_id, thread_id, usage, lead_id=""):
+        seen["selected"] = list(selected)
+        seen["lead_id"] = lead_id
+        return "done"
+
+    monkeypatch.setattr(rt.CrewRuntime, "_kickoff", fake_kickoff)
+    runtime = _runtime([])
+    asyncio.run(runtime.handle_prompt({**message, "agents": _specs()}))
+    return seen
+
+
+def test_mentioning_the_lead_makes_it_a_crew_turn(monkeypatch):
+    seen = _selection(
+        {"runId": "r1", "prompt": "build the product", "mentions": [{"programId": "lead-1"}]},
+        monkeypatch,
+    )
+    assert seen["lead_id"] == "lead-1"
+    # The lead owns the record and writes the one answer.
+    assert seen["selected"] == ["lead-1"]
+
+
+def test_mentioning_a_teammate_is_that_agent_alone(monkeypatch):
+    seen = _selection(
+        {"runId": "r1", "prompt": "fix the bug", "mentions": [{"programId": "eng-1"}]},
+        monkeypatch,
+    )
+    assert seen["lead_id"] == ""
+    assert seen["selected"] == ["eng-1"]
+
+
+def test_a_prompt_addressed_to_nobody_goes_to_the_lead(monkeypatch):
+    seen = _selection({"runId": "r1", "prompt": "what should we do next?"}, monkeypatch)
+    # A project-wide prompt is the lead's job when there is one — rather than
+    # every agent answering the same question separately.
+    assert seen["lead_id"] == "lead-1"
+    assert seen["selected"] == ["lead-1"]
+
+
+def test_a_project_with_no_lead_still_runs_its_whole_team(monkeypatch):
+    import decillion_caspar_bridge.runtime as rt
+
+    leaderless = [
+        {"programId": "eng-1", "username": "eng", "lead": False},
+        {"programId": "des-1", "username": "des", "lead": False},
+    ]
+    monkeypatch.setattr(
+        rt, "build_roster", lambda specs, *_a, **_k: {
+            str(s["programId"]): f"AGENT:{s['programId']}" for s in specs
+        }
+    )
+    seen = {}
+
+    async def fake_kickoff(self, prompt, roster, selected, specs, run_id, thread_id, usage, lead_id=""):
+        seen["selected"] = list(selected)
+        seen["lead_id"] = lead_id
+        return "done"
+
+    monkeypatch.setattr(rt.CrewRuntime, "_kickoff", fake_kickoff)
+    asyncio.run(_runtime([]).handle_prompt({"runId": "r1", "prompt": "go", "agents": leaderless}))
+    assert seen["lead_id"] == ""
+    assert seen["selected"] == ["eng-1", "des-1"]
+
+
+def test_the_lead_leads_even_when_mentioned_alongside_a_teammate(monkeypatch):
+    seen = _selection(
+        {
+            "runId": "r1",
+            "prompt": "ship it",
+            "mentions": [{"programId": "eng-1"}, {"programId": "lead-1"}],
+        },
+        monkeypatch,
+    )
+    # Naming the lead is asking for the objective to be run, and the lead
+    # decides who works on it — including whether that is the teammate also
+    # named. Two overlapping runs for one message is the thing to avoid.
+    assert seen["lead_id"] == "lead-1"
+    assert seen["selected"] == ["lead-1"]
+
+
+def test_a_step_names_the_teammate_that_did_it():
+    from decillion_caspar_bridge.events import CrewEventForwarder
+
+    class _Agent:
+        role = "Designer"
+
+    class _Task:
+        description = "lay out the page"
+        agent = _Agent()
+
+    seen = []
+    CrewEventForwarder(lambda kind, payload: seen.append((kind, payload)), "r1", "lead-1")._step(
+        "started", _Task()
+    )
+    kind, payload = seen[0]
+    assert kind == "step"
+    # The run belongs to the lead; the work does not.
+    assert payload["agentProgramId"] == "lead-1"
+    assert payload["agentName"] == "Designer"
+
+
+def test_a_step_with_no_named_agent_claims_none():
+    from decillion_caspar_bridge.events import CrewEventForwarder
+
+    seen = []
+    CrewEventForwarder(lambda kind, payload: seen.append((kind, payload)), "r1", "lead-1")._step(
+        "started", None
+    )
+    assert "agentName" not in seen[0][1]
