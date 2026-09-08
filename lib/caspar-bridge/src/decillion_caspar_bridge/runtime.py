@@ -25,7 +25,10 @@ Two rules from the platform shape the design:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
+import threading
 import time
 from collections import deque
 from typing import Any
@@ -45,6 +48,110 @@ _WORK_HISTORY_LIMIT = 200
 #: number in flight, so a project that is prompted faster than it can think
 #: queues rather than opening an unbounded number of model conversations.
 _MAX_CONCURRENT_RUNS = 4
+
+_MAX_HANDOFF_DEPTH = 6
+_MAX_HANDOFFS_PER_ANSWER = 4
+
+
+def _prose_for_mentions(text: str) -> str:
+    """Remove syntax where an ``@word`` is data rather than an addressee."""
+    text = re.sub(r"```[\s\S]*?```", " ", text)
+    text = re.sub(r"`[^`\n]*`", " ", text)
+    text = re.sub(r"https?://\S+", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b", " ", text)
+    text = re.sub(r"(?<!\w)@[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", " ", text)
+    return text
+
+
+def _courtesy_only(text: str, start: int, end: int) -> bool:
+    """Whether the sentence merely credits/thanks the mentioned teammate."""
+    left = max(text.rfind(".", 0, start), text.rfind("!", 0, start), text.rfind("\n", 0, start))
+    stops = [i for i in (text.find(".", end), text.find("!", end), text.find("\n", end)) if i >= 0]
+    right = min(stops) if stops else len(text)
+    sentence = text[left + 1 : right].lower()
+    courtesy = re.search(r"\b(thanks?|thank you|credit|kudos|great work|well done)\b", sentence)
+    instruction = re.search(
+        r"\b(please|need|must|should|can you|could you|review|research|build|write|fix|create|"
+        r"investigate|verify|test|finish|continue|implement|analy[sz]e|take over|handle)\b",
+        sentence,
+    )
+    return courtesy is not None and instruction is None
+
+
+def _handoff_targets(
+    text: str,
+    specs: list[dict[str, Any]],
+    excluded: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Resolve ordered, explicit agent handles from an answer without guessing."""
+    prose = _prose_for_mentions(text)
+    by_handle: dict[str, list[dict[str, Any]]] = {}
+    for spec in specs:
+        handle = str(spec.get("username") or "").strip().lstrip("@").lower()
+        if handle:
+            by_handle.setdefault(handle, []).append(spec)
+    skipped = excluded or set()
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"(?<![\w@])@([A-Za-z0-9][A-Za-z0-9_.-]*)", prose):
+        candidates = by_handle.get(match.group(1).lower(), [])
+        # A loose or ambiguous name is not authorization to spend money.
+        if len(candidates) != 1 or _courtesy_only(prose, match.start(), match.end()):
+            continue
+        spec = candidates[0]
+        program_id = str(spec.get("programId") or "")
+        if not program_id or program_id in skipped or program_id in seen:
+            continue
+        seen.add(program_id)
+        out.append(spec)
+        if len(out) >= _MAX_HANDOFFS_PER_ANSWER:
+            break
+    return out
+
+
+class _OrderedRunEmitter:
+    """Serialize one run's work events before its answer/terminal event."""
+
+    def __init__(self, runtime: "CrewRuntime", run_id: str) -> None:
+        self._runtime = runtime
+        self._run_id = run_id
+        self._loop = asyncio.get_running_loop()
+        self._queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
+        self._seq = 0
+        self._lock = threading.Lock()
+        self._worker = asyncio.create_task(self._run())
+
+    def emit(self, kind: str, payload: dict[str, Any]) -> None:
+        with self._lock:
+            self._seq += 1
+            seq = self._seq
+        body = dict(payload)
+        body["seq"] = seq
+        body["eventId"] = f"{self._run_id}:{seq}"
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, (kind, body))
+
+    async def flush(self) -> None:
+        # Let callbacks scheduled from the CrewAI worker thread enqueue before
+        # observing the queue's unfinished count.
+        await asyncio.sleep(0)
+        await self._queue.join()
+
+    async def close(self) -> None:
+        await self.flush()
+        await self._queue.put(None)
+        await self._worker
+
+    async def _run(self) -> None:
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                self._queue.task_done()
+                return
+            kind, payload = item
+            try:
+                await self._runtime._post_reliably(kind, payload)
+            finally:
+                self._queue.task_done()
 
 
 def _token_usage(result: Any, crew: Any) -> dict[str, int]:
@@ -242,19 +349,20 @@ class CrewRuntime:
             tools,
         )
         if not roster:
-            await self._post(
+            owner = _asking_agent(message, specs)
+            await self._post_reliably(
                 "answer",
                 {
                     "runId": run_id,
                     "threadId": thread_id,
-                    "agentProgramId": str(message.get("agentProgramId") or ""),
+                    **owner,
                     "text": "This project has no agents that can run yet.",
                 },
             )
             # Nothing ran, but the turn was authorized. Report zero usage so the
             # meter closes it out now instead of leaving the payer's funds
             # reserved until the authorization's TTL expires.
-            await self._post(
+            await self._post_reliably(
                 "usage",
                 {
                     "runId": run_id,
@@ -264,6 +372,20 @@ class CrewRuntime:
                     "promptTokens": 0,
                     "completionTokens": 0,
                     "success": False,
+                },
+            )
+            await self._post_reliably(
+                "run-terminal",
+                {
+                    "runId": run_id,
+                    "jobId": str(message.get("jobId") or run_id),
+                    "parentRunId": str(message.get("parentRunId") or ""),
+                    "threadId": thread_id,
+                    **owner,
+                    "status": "failed",
+                    "startedAt": time.time() * 1000,
+                    "endedAt": time.time() * 1000,
+                    "error": "this project has no runnable agents",
                 },
             )
             return
@@ -302,9 +424,12 @@ class CrewRuntime:
         started_at = time.time()
         record = {
             "runId": run_id,
+            "jobId": str(message.get("jobId") or run_id),
+            "parentRunId": str(message.get("parentRunId") or ""),
             "spaceId": self._space_id,
             "threadId": thread_id,
             "agentProgramId": selected[0],
+            "agentName": str(next((s.get("name") for s in specs if str(s.get("programId")) == selected[0]), "") or ""),
             "agents": selected,
             "prompt": prompt,
             "startedAt": started_at,
@@ -313,6 +438,7 @@ class CrewRuntime:
         self._active[run_id] = record
 
         usage: dict[str, Any] = {"promptTokens": 0, "completionTokens": 0}
+        heartbeat = asyncio.create_task(self._heartbeat(record))
         async with self._semaphore:
             try:
                 output = await self._kickoff(
@@ -327,20 +453,27 @@ class CrewRuntime:
                 )
                 record["status"] = "done"
                 record["output"] = output
+                await self._start_handoffs(message, specs, selected, record, output)
             except Exception as exc:  # noqa: BLE001 - a failed turn is reported, not raised
                 logger.exception("run %s failed", run_id)
                 record["status"] = "failed"
                 record["error"] = str(exc)
-                await self._post(
+                await self._post_reliably(
                     "answer",
                     {
                         "runId": run_id,
                         "threadId": thread_id,
                         "agentProgramId": selected[0],
+                        "agentName": record.get("agentName") or "",
                         "text": f"That run could not be completed: {exc}",
                     },
                 )
             finally:
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except asyncio.CancelledError:
+                    pass
                 finished_at = time.time()
                 record["finishedAt"] = finished_at
                 record["usage"] = dict(usage)
@@ -350,7 +483,7 @@ class CrewRuntime:
                 # a lost report leaves the run's authorization to expire rather
                 # than overcharging, which is why it is sent last and separately
                 # from the answer.
-                await self._post(
+                await self._post_reliably(
                     "usage",
                     {
                         "runId": run_id,
@@ -362,7 +495,37 @@ class CrewRuntime:
                         "success": record.get("status") == "done",
                     },
                 )
+                await self._post_reliably(
+                    "run-terminal",
+                    {
+                        "runId": run_id,
+                        "jobId": record.get("jobId") or run_id,
+                        "parentRunId": record.get("parentRunId") or "",
+                        "threadId": thread_id,
+                        "agentProgramId": record.get("agentProgramId") or "",
+                        "agentName": record.get("agentName") or "",
+                        "status": "succeeded" if record.get("status") == "done" else "failed",
+                        "startedAt": started_at * 1000,
+                        "endedAt": finished_at * 1000,
+                        "error": record.get("error") or "",
+                    },
+                )
 
+    async def _heartbeat(self, record: dict[str, Any]) -> None:
+        """Keep the durable ledger fresh while queued or inside a long model call."""
+        while True:
+            await asyncio.sleep(20)
+            await self._post_reliably(
+                "heartbeat",
+                {
+                    "runId": str(record.get("runId") or ""),
+                    "jobId": str(record.get("jobId") or ""),
+                    "parentRunId": str(record.get("parentRunId") or ""),
+                    "threadId": str(record.get("threadId") or "main"),
+                    "agentProgramId": str(record.get("agentProgramId") or ""),
+                    "agentName": str(record.get("agentName") or ""),
+                },
+            )
     @staticmethod
     def _build_crew(
         prompt: str,
@@ -465,17 +628,38 @@ class CrewRuntime:
 
         loop = asyncio.get_running_loop()
 
+        ordered = _OrderedRunEmitter(self, run_id)
+
         def emit(kind: str, payload: dict[str, Any]) -> None:
             payload.setdefault("threadId", thread_id)
-            asyncio.run_coroutine_threadsafe(self._post(kind, payload), loop)
+            ordered.emit(kind, payload)
 
-        forwarder = CrewEventForwarder(emit, run_id, selected[0])
+        actors = {
+            id(agent): (pid, str(by_id.get(pid, {}).get("name") or ""))
+            for pid, agent in roster.items()
+        }
+        sources = [crew, *getattr(crew, "tasks", []), *roster.values()]
+        forwarder = CrewEventForwarder(
+            emit,
+            run_id,
+            selected[0],
+            str(by_id.get(selected[0], {}).get("name") or ""),
+            sources=sources,
+            actors=actors,
+        )
         forwarder.register()
 
         # CrewAI is synchronous; running it on the loop's executor keeps the
         # socket responsive, which is what lets a second prompt arrive (and a
         # step be streamed) while this turn is still thinking.
-        result = await loop.run_in_executor(None, crew.kickoff)
+        try:
+            result = await loop.run_in_executor(None, crew.kickoff)
+        finally:
+            # Event handlers are global inside CrewAI. Tear this run's handlers
+            # down before another turn starts, then drain every event already
+            # emitted so the answer cannot overtake its final completed step.
+            forwarder.unregister()
+            await ordered.close()
         text = getattr(result, "raw", None) or str(result)
         # Token counts come from the crew that just ran. They are written into
         # the caller's dict rather than returned, so a turn that raises after
@@ -484,7 +668,7 @@ class CrewRuntime:
 
         # The one answer this turn writes. Steps already streamed under the
         # same run tag; nothing else posts an answer for this run.
-        await self._post(
+        await self._post_reliably(
             "answer",
             {
                 "runId": run_id,
@@ -496,14 +680,150 @@ class CrewRuntime:
         )
         return text
 
+    async def _start_handoffs(
+        self,
+        message: dict[str, Any],
+        specs: list[dict[str, Any]],
+        selected: list[str],
+        record: dict[str, Any],
+        answer: str,
+    ) -> None:
+        """Launch explicitly mentioned teammates as separately billed child runs.
+
+        Both calls use routes fixed in the project's bridge grant. The quote is
+        delegated against the owner's existing pool; the child prompt is then
+        accepted by the server and published back to this runtime. No browser,
+        private key, or client-maintained task board participates.
+        """
+        if message.get("serverOrchestrate") is not True:
+            return
+        targets = _handoff_targets(answer, specs, set(selected))
+        if not targets:
+            return
+
+        orchestration = dict(message.get("orchestration") or {})
+        depth = max(0, int(orchestration.get("depth") or 0))
+        max_hops = min(_MAX_HANDOFF_DEPTH, max(1, int(orchestration.get("maxHops") or _MAX_HANDOFF_DEPTH)))
+        payer = str(orchestration.get("payerUserId") or "")
+        pool_id = str(orchestration.get("poolId") or "")
+        owner_program_id = str(record.get("agentProgramId") or "")
+        owner_name = str(record.get("agentName") or "")
+        if depth >= max_hops:
+            await self._handoff_notice(record, "Agent hand-off depth limit reached.")
+            return
+        if self._call is None or not payer or not pool_id:
+            await self._handoff_notice(
+                record,
+                "A teammate was mentioned, but this run has no delegated billing pool for a server-side hand-off.",
+            )
+            return
+
+        job_id = str(record.get("jobId") or record.get("runId") or "")
+        root_run_id = str(message.get("rootRunId") or record.get("runId") or "")
+        for target in targets:
+            target_id = str(target.get("programId") or "")
+            target_name = str(target.get("name") or target.get("username") or target_id)
+            child_id = hashlib.sha256(
+                f"{record.get('runId')}\0{target_id}".encode("utf-8")
+            ).hexdigest()[:32]
+            try:
+                quote_result = await self._call(
+                    "billing/quote",
+                    {
+                        "requestId": child_id,
+                        "kind": "agent",
+                        "resourceId": target_id,
+                        "projectId": self._space_id,
+                        "payerUserId": payer,
+                        "estimate": {
+                            "runtimeMs": 60_000,
+                            "sandboxMs": 300_000,
+                            "inputTokens": 200_000,
+                            "outputTokens": 8_000,
+                        },
+                    },
+                )
+                if quote_result.get("ok") is False:
+                    raise RuntimeError(str(quote_result.get("error") or "delegated quote was refused"))
+                quote = quote_result.get("quote") or {}
+                quote_id = str(quote.get("quoteId") or "")
+                if not quote_id:
+                    raise RuntimeError("delegated quote returned no quote id")
+
+                child_orchestration = {
+                    **orchestration,
+                    "depth": depth + 1,
+                    "maxHops": max_hops,
+                    "payerUserId": payer,
+                    "poolId": pool_id,
+                }
+                handle = str(target.get("username") or "").lstrip("@")
+                prompt_result = await self._call(
+                    "crew/prompt",
+                    {
+                        "runId": child_id,
+                        "jobId": job_id,
+                        "parentRunId": str(record.get("runId") or ""),
+                        "rootRunId": root_run_id,
+                        "spaceId": self._space_id,
+                        "threadId": str(record.get("threadId") or "main"),
+                        "prompt": (
+                            f"Handoff from {owner_name or owner_program_id}:\n\n{answer}\n\n"
+                            f"Complete the work addressed to @{handle or target_name}."
+                        ),
+                        "agentProgramId": target_id,
+                        "targetAgentId": target_id,
+                        "mentions": [{"programId": target_id, "id": target_id, "name": target_name, "handle": handle}],
+                        "self": {"programId": target_id, "id": target_id, "name": target_name, "handle": handle},
+                        "serverOrchestrate": True,
+                        "orchestration": child_orchestration,
+                        "billingAuthorization": {
+                            "poolId": pool_id,
+                            "payerUserId": payer,
+                            "quoteId": quote_id,
+                        },
+                    },
+                )
+                if prompt_result.get("ok") is False:
+                    raise RuntimeError(str(prompt_result.get("error") or "child prompt was refused"))
+            except Exception as exc:  # noqa: BLE001 - one branch must not cancel siblings
+                logger.exception("handoff from %s to %s failed", record.get("runId"), target_id)
+                await self._handoff_notice(record, f"Handoff to {target_name} could not start: {exc}")
+
+    async def _handoff_notice(self, record: dict[str, Any], text: str) -> None:
+        await self._post_reliably(
+            "step",
+            {
+                "runId": str(record.get("runId") or ""),
+                "jobId": str(record.get("jobId") or ""),
+                "parentRunId": str(record.get("parentRunId") or ""),
+                "threadId": str(record.get("threadId") or "main"),
+                "agentProgramId": str(record.get("agentProgramId") or ""),
+                "agentName": str(record.get("agentName") or ""),
+                "status": "failed",
+                "text": text,
+            },
+        )
+
     # ── outbound ─────────────────────────────────────────────────────────
 
-    async def _post(self, kind: str, payload: dict[str, Any]) -> None:
+    async def _post(self, kind: str, payload: dict[str, Any]) -> bool:
         body = dict(payload)
         body["kind"] = kind
         body["spaceId"] = self._space_id
         body.setdefault("createdAt", time.time() * 1000)
         try:
             await self._send("crew/message", body)
+            return True
         except Exception:  # noqa: BLE001 - the turn survives a lost step
             logger.exception("could not post a %s for run %s", kind, payload.get("runId"))
+            return False
+
+    async def _post_reliably(self, kind: str, payload: dict[str, Any]) -> bool:
+        """Retry a run event without reordering later events around it."""
+        for attempt in range(3):
+            if await self._post(kind, payload):
+                return True
+            if attempt < 2:
+                await asyncio.sleep(0.25 * (attempt + 1))
+        return False

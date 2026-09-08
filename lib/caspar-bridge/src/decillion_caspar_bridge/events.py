@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable, Mapping
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -37,11 +38,24 @@ class CrewEventForwarder:
     one sandbox, and a global listener could not tell them apart.
     """
 
-    def __init__(self, emit: Emitter, run_id: str, agent_program_id: str) -> None:
+    def __init__(
+        self,
+        emit: Emitter,
+        run_id: str,
+        agent_program_id: str,
+        agent_name: str = "",
+        *,
+        sources: Iterable[Any] = (),
+        actors: Mapping[int, tuple[str, str]] | None = None,
+    ) -> None:
         self._emit = emit
         self._run_id = run_id
         self._agent_program_id = agent_program_id
-        self._registered: list[Any] = []
+        self._agent_name = agent_name
+        self._source_ids = {id(source) for source in sources if source is not None}
+        self._actors = dict(actors or {})
+        self._registered: list[tuple[type[Any], Any]] = []
+        self._bus: Any = None
 
     def register(self) -> None:
         """Subscribe to the events this bridge forwards.
@@ -66,39 +80,89 @@ class CrewEventForwarder:
             return
 
         bus = crewai_event_bus
+        self._bus = bus
 
         @bus.on(TaskStartedEvent)
         def _task_started(_source: Any, event: Any) -> None:
+            if not self._owns(_source, event):
+                return
             self._step("started", getattr(event, "task", None))
 
         @bus.on(TaskCompletedEvent)
         def _task_completed(_source: Any, event: Any) -> None:
+            if not self._owns(_source, event):
+                return
             self._step("completed", getattr(event, "task", None), getattr(event, "output", None))
 
         @bus.on(TaskFailedEvent)
         def _task_failed(_source: Any, event: Any) -> None:
+            if not self._owns(_source, event):
+                return
             self._step("failed", getattr(event, "task", None), getattr(event, "error", None))
 
         @bus.on(ToolUsageStartedEvent)
         def _tool_started(_source: Any, event: Any) -> None:
+            if not self._owns(_source, event):
+                return
             self._tool("started", event)
 
         @bus.on(ToolUsageFinishedEvent)
         def _tool_finished(_source: Any, event: Any) -> None:
+            if not self._owns(_source, event):
+                return
             self._tool("finished", event)
 
         @bus.on(ToolUsageErrorEvent)
         def _tool_error(_source: Any, event: Any) -> None:
+            if not self._owns(_source, event):
+                return
             self._tool("error", event)
 
         self._registered = [
-            _task_started,
-            _task_completed,
-            _task_failed,
-            _tool_started,
-            _tool_finished,
-            _tool_error,
+            (TaskStartedEvent, _task_started),
+            (TaskCompletedEvent, _task_completed),
+            (TaskFailedEvent, _task_failed),
+            (ToolUsageStartedEvent, _tool_started),
+            (ToolUsageFinishedEvent, _tool_finished),
+            (ToolUsageErrorEvent, _tool_error),
         ]
+
+    def unregister(self) -> None:
+        """Remove every handler installed by this run.
+
+        The CrewAI event bus is process-global. Leaving a run's handlers behind
+        makes every later task appear under every earlier run id and grows work
+        fan-out without bound.
+        """
+        bus = self._bus
+        if bus is not None:
+            for event_type, handler in self._registered:
+                bus.off(event_type, handler)
+        self._registered = []
+        self._bus = None
+
+    def _owns(self, source: Any, event: Any) -> bool:
+        """Whether an event belongs to this run's Crew/Task/Agent objects."""
+        if not self._source_ids:
+            return True
+        task = getattr(event, "task", None) or getattr(event, "from_task", None)
+        agent = (
+            getattr(event, "agent", None)
+            or getattr(event, "from_agent", None)
+            or getattr(task, "agent", None)
+        )
+        return any(
+            candidate is not None and id(candidate) in self._source_ids
+            for candidate in (source, task, agent)
+        )
+
+    def _actor(self, source: Any) -> tuple[str, str]:
+        if source is None:
+            return "", ""
+        agent = getattr(source, "agent", None) or source
+        if identity := self._actors.get(id(agent)):
+            return identity
+        return "", _actor_of(agent)
 
     # ── emitters ─────────────────────────────────────────────────────────
 
@@ -107,6 +171,7 @@ class CrewEventForwarder:
         payload = {
             "runId": self._run_id,
             "agentProgramId": self._agent_program_id,
+            "agentName": self._agent_name,
             "status": state,
             "text": description,
             "data": {"detail": _text(detail)} if detail is not None else None,
@@ -114,22 +179,29 @@ class CrewEventForwarder:
         # Who actually did this. On a led turn the run belongs to the lead but
         # the work is done by whichever teammate it delegated to, so without
         # this the whole crew's trail reads as the lead doing everything.
-        if actor := _actor_of(task):
-            payload["agentName"] = actor
+        actor_program_id, actor_name = self._actor(task)
+        if actor_program_id:
+            payload["actorProgramId"] = actor_program_id
+        if actor_name:
+            payload["actorName"] = actor_name
         self._emit("step", payload)
 
     def _tool(self, state: str, event: Any) -> None:
         payload = {
             "runId": self._run_id,
             "agentProgramId": self._agent_program_id,
+            "agentName": self._agent_name,
             "status": state,
             "toolName": getattr(event, "tool_name", "") or "",
             "toolArgs": _jsonable(getattr(event, "tool_args", None)),
             "toolResult": _text(getattr(event, "output", None)),
             "text": getattr(event, "tool_name", "") or "",
         }
-        if actor := _actor_of(getattr(event, "agent", None) or event):
-            payload["agentName"] = actor
+        actor_program_id, actor_name = self._actor(getattr(event, "agent", None) or event)
+        if actor_program_id:
+            payload["actorProgramId"] = actor_program_id
+        if actor_name:
+            payload["actorName"] = actor_name
         self._emit("toolcall", payload)
 
 

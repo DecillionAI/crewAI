@@ -22,7 +22,7 @@ def test_a_prompt_with_no_agents_answers_instead_of_failing_silently():
         )
     )
     actions = [payload for action, payload in sent if action == "crew/message"]
-    assert [a["kind"] for a in actions] == ["answer", "usage"]
+    assert [a["kind"] for a in actions] == ["answer", "usage", "run-terminal"]
     assert actions[0]["spaceId"] == "space-1"
     # Nothing ran, so the meter is told zero rather than left to time the
     # payer's authorization out.
@@ -92,8 +92,9 @@ def test_a_failed_run_still_reports_what_it_used(monkeypatch):
     assert usage["runId"] == "r1"
     assert usage["success"] is False
     assert usage["runtimeMs"] >= 0
-    # The usage report is last: nothing settles a run before its answer is out.
-    assert kinds[-1] == "usage"
+    # Settlement follows the answer and the explicit terminal event closes the
+    # durable server ledger last.
+    assert kinds[-2:] == ["usage", "run-terminal"]
 
 
 def test_token_usage_is_read_from_whichever_shape_crewai_offers():
@@ -347,14 +348,15 @@ def test_a_step_names_the_teammate_that_did_it():
         agent = _Agent()
 
     seen = []
-    CrewEventForwarder(lambda kind, payload: seen.append((kind, payload)), "r1", "lead-1")._step(
+    CrewEventForwarder(lambda kind, payload: seen.append((kind, payload)), "r1", "lead-1", "Lead")._step(
         "started", _Task()
     )
     kind, payload = seen[0]
     assert kind == "step"
     # The run belongs to the lead; the work does not.
     assert payload["agentProgramId"] == "lead-1"
-    assert payload["agentName"] == "Designer"
+    assert payload["agentName"] == "Lead"
+    assert payload["actorName"] == "Designer"
 
 
 def test_a_step_with_no_named_agent_claims_none():
@@ -364,7 +366,55 @@ def test_a_step_with_no_named_agent_claims_none():
     CrewEventForwarder(lambda kind, payload: seen.append((kind, payload)), "r1", "lead-1")._step(
         "started", None
     )
-    assert "agentName" not in seen[0][1]
+    assert seen[0][1]["agentName"] == ""
+
+
+def test_a_step_uses_the_teammates_stable_program_identity():
+    from decillion_caspar_bridge.events import CrewEventForwarder
+
+    class _Agent:
+        role = "Research role"
+
+    class _Task:
+        description = "verify sources"
+        agent = _Agent()
+
+    seen = []
+    CrewEventForwarder(
+        lambda kind, payload: seen.append((kind, payload)),
+        "r1",
+        "lead-1",
+        "Lead",
+        actors={id(_Task.agent): ("research-1", "Researcher")},
+    )._step("started", _Task())
+    payload = seen[0][1]
+    assert payload["agentProgramId"] == "lead-1"
+    assert payload["agentName"] == "Lead"
+    assert payload["actorProgramId"] == "research-1"
+    assert payload["actorName"] == "Researcher"
+
+
+def test_forwarder_filters_other_runs_and_unregisters_every_handler():
+    from decillion_caspar_bridge.events import CrewEventForwarder
+
+    ours = object()
+    theirs = object()
+    forwarder = CrewEventForwarder(lambda *_a: None, "r1", "lead-1", sources=[ours])
+    assert forwarder._owns(ours, object()) is True
+    assert forwarder._owns(theirs, object()) is False
+
+    removed = []
+
+    class _Bus:
+        def off(self, event_type, handler):
+            removed.append((event_type, handler))
+
+    handler = lambda *_a: None
+    forwarder._bus = _Bus()
+    forwarder._registered = [(str, handler), (int, handler)]
+    forwarder.unregister()
+    assert removed == [(str, handler), (int, handler)]
+    assert forwarder._registered == []
 
 
 def test_a_question_is_attributed_to_the_agent_that_was_addressed():
@@ -386,3 +436,101 @@ def test_a_question_is_attributed_to_the_agent_that_was_addressed():
     # Nobody at all: empty, which the creature refuses rather than posting a
     # message from no one.
     assert _asking_agent({}, [])["agentProgramId"] == ""
+
+
+def test_handoff_mentions_only_resolve_unambiguous_prose_handles():
+    from decillion_caspar_bridge.runtime import _handoff_targets
+
+    specs = [
+        {"programId": "research-1", "username": "researcher", "name": "Researcher"},
+        {"programId": "build-1", "username": "builder", "name": "Builder"},
+    ]
+    text = """Please @researcher verify the market.
+```css
+@media (width > 10px) {}
+```
+Install `@types/node`, email me@example.com, and see https://x.test/@builder.
+Thanks @builder!"""
+    assert [s["programId"] for s in _handoff_targets(text, specs)] == ["research-1"]
+
+
+def test_server_handoff_quotes_and_launches_a_deterministic_child():
+    sent = []
+    called = []
+
+    async def send(action, payload):
+        sent.append((action, payload))
+        return {"ok": True}
+
+    async def call(action, payload):
+        called.append((action, payload))
+        if action == "billing/quote":
+            return {"ok": True, "quote": {"quoteId": "quote-child"}}
+        return {"ok": True, "queued": True}
+
+    runtime = CrewRuntime("space-1", send, call=call)
+    record = {
+        "runId": "parent-run",
+        "jobId": "job-1",
+        "threadId": "main",
+        "agentProgramId": "lead-1",
+        "agentName": "Lead",
+    }
+    message = {
+        "serverOrchestrate": True,
+        "rootRunId": "parent-run",
+        "orchestration": {
+            "depth": 0,
+            "maxHops": 6,
+            "payerUserId": "owner-1",
+            "poolId": "pool-1",
+        },
+    }
+    specs = [
+        {"programId": "lead-1", "username": "lead", "name": "Lead"},
+        {"programId": "research-1", "username": "researcher", "name": "Researcher"},
+    ]
+    asyncio.run(
+        runtime._start_handoffs(
+            message, specs, ["lead-1"], record,
+            "@researcher please verify these findings.",
+        )
+    )
+
+    assert [action for action, _payload in called] == ["billing/quote", "crew/prompt"]
+    quote_payload = called[0][1]
+    child_payload = called[1][1]
+    assert quote_payload["requestId"] == child_payload["runId"]
+    assert child_payload["parentRunId"] == "parent-run"
+    assert child_payload["jobId"] == "job-1"
+    assert child_payload["agentProgramId"] == "research-1"
+    assert child_payload["billingAuthorization"] == {
+        "poolId": "pool-1",
+        "payerUserId": "owner-1",
+        "quoteId": "quote-child",
+    }
+    assert sent == []
+
+
+def test_missing_handoff_billing_is_visible_in_the_parent_trail():
+    sent = []
+    runtime = _runtime(sent)
+    asyncio.run(
+        runtime._start_handoffs(
+            {"serverOrchestrate": True, "orchestration": {}},
+            [
+                {"programId": "lead-1", "username": "lead", "name": "Lead"},
+                {"programId": "research-1", "username": "researcher", "name": "Researcher"},
+            ],
+            ["lead-1"],
+            {
+                "runId": "parent-run", "jobId": "job-1", "threadId": "main",
+                "agentProgramId": "lead-1", "agentName": "Lead",
+            },
+            "@researcher please continue.",
+        )
+    )
+    notice = sent[0][1]
+    assert notice["kind"] == "step"
+    assert notice["status"] == "failed"
+    assert "billing pool" in notice["text"]
