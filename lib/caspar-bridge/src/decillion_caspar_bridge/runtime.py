@@ -35,6 +35,7 @@ from typing import Any
 
 from .events import CrewEventForwarder
 from .roster import as_manager, build_roster
+from .state import read_json, state_dir, write_json_atomically
 from .tools import build_tools
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,7 @@ class CrewRuntime:
         llm_proxy: Any = None,
         call: Any = None,
         await_result: Any = None,
+        outbox: Any = None,
     ) -> None:
         self._space_id = space_id
         #: The platform's model proxy, if this runtime has one. Agents are
@@ -255,11 +257,55 @@ class CrewRuntime:
         #: creature. Injected rather than imported so the runtime can be
         #: exercised without a socket.
         self._send = send
+        #: The durable outbox, when this runtime has one. Every run event goes
+        #: through it: persisted to the project's own disk first, delivered
+        #: after, retried until the node accepts it. Without one the runtime
+        #: still works and still retries, but only in memory — which is what a
+        #: unit test wants and what a sandbox must never rely on.
+        self._outbox = outbox
         self._history: deque[dict[str, Any]] = deque(maxlen=_WORK_HISTORY_LIMIT)
         self._semaphore = asyncio.Semaphore(_MAX_CONCURRENT_RUNS)
         self._active: dict[str, dict[str, Any]] = {}
+        #: What each finished run was, on disk. `crew/work` used to answer from
+        #: a bounded in-memory deque alone, so a sandbox that slept — which is
+        #: every sandbox, after five idle minutes — came back having forgotten
+        #: everything its agents had done.
+        self._work_dir = state_dir("work")
+        self._load_work_record()
+        #: The loop the socket lives on, captured when the first turn starts.
+        #: CrewAI runs on worker threads, so anything they emit has to be handed
+        #: back across this.
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     # ── the work record ──────────────────────────────────────────────────
+
+    def _load_work_record(self) -> None:
+        """Reload what previous processes recorded, oldest first."""
+        rows: list[dict[str, Any]] = []
+        for path in sorted(self._work_dir.glob("*.json")):
+            row = read_json(path)
+            if isinstance(row, dict) and row.get("runId"):
+                rows.append(row)
+        rows.sort(key=lambda row: float(row.get("startedAt") or 0))
+        for row in rows[-_WORK_HISTORY_LIMIT:]:
+            self._history.append(row)
+        # Trim what the deque could not keep, so the directory stays the same
+        # size as the record it backs rather than growing for the life of the
+        # project's volume.
+        for path in sorted(self._work_dir.glob("*.json"))[:-_WORK_HISTORY_LIMIT]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def _save_work_record(self, record: dict[str, Any]) -> None:
+        run_id = str(record.get("runId") or "")
+        if not run_id:
+            return
+        safe = "".join(ch for ch in run_id if ch.isalnum() or ch in "-_")[:96]
+        if safe:
+            write_json_atomically(self._work_dir / f"{safe}.json", record)
+
 
     def work(self, agent_program_id: str = "", run_id: str = "", limit: int = 0) -> list[dict]:
         """What this project's agents have done, newest first.
@@ -295,6 +341,8 @@ class CrewRuntime:
             return
 
         thread_id = str(message.get("threadId") or "main")
+        if not await self._acknowledge_run(message, run_id, thread_id):
+            return
         specs: list[dict[str, Any]] = list(message.get("agents") or [])
         # Bind each agent's model to its Decillion provider before the crew is
         # built: LiteLLM sends the proxy only a model string, and the creature
@@ -323,6 +371,7 @@ class CrewRuntime:
         # catalogue is already warm (see `warm_catalog`) and this returns at
         # once.
         loop = asyncio.get_running_loop()
+        self._loop = loop
         # The question tool is offered only when this project can actually
         # deliver a question. That is a property of the machine's grant — fixed
         # when it was provisioned — so the platform is what says whether it is
@@ -341,6 +390,7 @@ class CrewRuntime:
             loop,
             turn,
             self._await_result,
+            self._acknowledge_question,
         )
         roster = build_roster(
             specs,
@@ -479,6 +529,7 @@ class CrewRuntime:
                 record["usage"] = dict(usage)
                 self._active.pop(run_id, None)
                 self._history.append(record)
+                self._save_work_record(record)
                 # What the run cost, reported once. The meter settles from this;
                 # a lost report leaves the run's authorization to expire rather
                 # than overcharging, which is why it is sent last and separately
@@ -510,6 +561,74 @@ class CrewRuntime:
                         "error": record.get("error") or "",
                     },
                 )
+
+    async def _acknowledge_run(
+        self, message: dict[str, Any], run_id: str, thread_id: str
+    ) -> bool:
+        """Tell the platform this runtime has the turn, and learn whether to run it.
+
+        Two things happen on this one call, and both have to happen before the
+        turn does anything slow:
+
+        * The platform holds every prompt in a durable inbox and replays whatever
+          nobody acknowledged. Without this a healthy long run would be
+          redelivered each time its dispatch lease expired, and a sandbox that
+          died between the publish and its first token would look exactly like
+          one that was working.
+        * The payer's slice is taken **here**, by the creature this reaches —
+          the only program the node lets reserve against the pool. So a run the
+          payer cannot fund is stopped now, before a tool is built or a model is
+          called, rather than after its answer has been given away.
+
+        Returns whether to proceed. A refusal ends the turn quietly: the platform
+        has already closed the run and said why.
+        """
+        payload = {
+            "runId": run_id,
+            "jobId": str(message.get("jobId") or run_id),
+            "threadId": thread_id,
+            "agentProgramId": str(message.get("agentProgramId") or ""),
+        }
+        if self._call is None:
+            # No request/response channel (a runtime under test). Record it
+            # durably and carry on — the acknowledgement still lands, and the
+            # reservation is still made when it does.
+            await self._post_reliably("run-ack", payload)
+            return True
+        try:
+            result = await self._call("crew/message", {**payload, "kind": "run-ack"})
+        except Exception as exc:  # noqa: BLE001 - an unreachable platform is not a refusal
+            logger.warning("could not acknowledge run %s: %s", run_id, exc)
+            await self._post_reliably("run-ack", payload)
+            return True
+        if isinstance(result, dict) and result.get("stop") is True:
+            logger.warning(
+                "run %s was refused by the platform: %s", run_id, result.get("error")
+            )
+            return False
+        return True
+
+    def _acknowledge_question(self, question_id: str) -> None:
+        """Confirm a person's answer reached the run that was waiting for it.
+
+        Called from the CrewAI worker thread, so it goes through the outbox
+        rather than the socket: the acknowledgement is what retires the question
+        on the platform, and one that is dropped leaves a question open forever
+        against a run that has already moved on.
+        """
+        if not question_id:
+            return
+        payload = {"runId": "", "questionId": question_id}
+        if self._outbox is not None:
+            self._outbox.post("question-ack", payload)
+            return
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._post("question-ack", payload), loop)
+        except Exception:  # noqa: BLE001 - the answer still stands
+            logger.exception("could not acknowledge question %s", question_id)
 
     async def _heartbeat(self, record: dict[str, Any]) -> None:
         """Keep the durable ledger fresh while queued or inside a long model call."""
@@ -820,7 +939,22 @@ class CrewRuntime:
             return False
 
     async def _post_reliably(self, kind: str, payload: dict[str, Any]) -> bool:
-        """Retry a run event without reordering later events around it."""
+        """Record a run event durably, then let the outbox deliver it.
+
+        With an outbox this returns as soon as the event is on the project's own
+        disk, which is the point: delivery is then somebody else's problem and it
+        is retried until the node accepts it, across reconnects, restarts and the
+        sandbox being replaced. Ordering is preserved because the outbox drains
+        in the order events were produced.
+
+        Without one — a unit test, a runtime exercised with no filesystem — it
+        falls back to the old in-memory retries. Three attempts over three
+        quarters of a second is not a delivery guarantee, which is exactly why it
+        is no longer what a sandbox uses.
+        """
+        if self._outbox is not None:
+            self._outbox.post(kind, payload)
+            return True
         for attempt in range(3):
             if await self._post(kind, payload):
                 return True

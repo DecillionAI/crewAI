@@ -445,6 +445,7 @@ def ask_tool(
     thread_id: str,
     agent_program_id: str,
     agent_name: str = "",
+    ack: Callable[[str], None] | None = None,
 ) -> Any:
     """Let an agent put a question to the project and wait for the answer.
 
@@ -510,12 +511,17 @@ def ask_tool(
                 lambda answer_id: asyncio.run_coroutine_threadsafe(
                     await_result(answer_id, QUESTION_TIMEOUT_SECONDS), loop
                 ).result(timeout=QUESTION_TIMEOUT_SECONDS + 30),
+                ack,
             )
 
     return AskTheProject()
 
 
-def ask_question(submit: Callable[[], Any], wait_for: Callable[[str], Any]) -> str:
+def ask_question(
+    submit: Callable[[], Any],
+    wait_for: Callable[[str], Any],
+    ack: Callable[[str], None] | None = None,
+) -> str:
     """Put a question to the project and report what came back.
 
     TWO waits, and the split is the point.
@@ -569,6 +575,18 @@ def ask_question(submit: Callable[[], Any], wait_for: Callable[[str], Any]) -> s
         logger.exception("waiting for an answer failed")
         return f"Error: the answer never arrived: {exc}"
     if isinstance(result, dict):
+        # Confirm receipt before doing anything with it. The platform holds an
+        # answered question until the runtime says it arrived — because
+        # publishing an answer to a bridge that had already gone used to retire
+        # the question at the same time, losing both the answer and the only
+        # record that anyone was still owed one.
+        if ack is not None:
+            question_id = str(result.get("questionId") or "")
+            if question_id:
+                try:
+                    ack(question_id)
+                except Exception:  # noqa: BLE001 - the answer still stands
+                    logger.exception("could not acknowledge question %s", question_id)
         if result.get("ok") is False:
             return f"Error: {result.get('error') or 'the question was refused'}"
         answer = str(result.get("answer") or "").strip()
@@ -836,6 +854,7 @@ def build_tools(
     loop: asyncio.AbstractEventLoop | None,
     turn: dict[str, str] | None = None,
     await_result: Callable[[str, float], Awaitable[Any]] | None = None,
+    ack_question: Callable[[str], None] | None = None,
 ) -> list[Any]:
     """Everything the agents on this turn can use.
 
@@ -869,6 +888,7 @@ def build_tools(
                         turn.get("threadId", "main"),
                         turn.get("agentProgramId", ""),
                         turn.get("agentName", ""),
+                        ack_question,
                     )
                 )
             except Exception:  # noqa: BLE001

@@ -15,6 +15,7 @@ import sys
 from .client import CasparBridgeClient
 from .config import load_config
 from .llm_proxy import LlmProxyServer
+from .outbox import Outbox
 from .runtime import CrewRuntime
 from .tools import warm_catalog
 
@@ -55,7 +56,17 @@ async def _run() -> int:
     llm_proxy = LlmProxyServer(call_creature, port=config.llm_proxy_port)
     await llm_proxy.start()
 
-    runtime = CrewRuntime(config.space_id, send, llm_proxy, call_creature, await_result)
+    # Everything a run produces goes out through here: written to the project's
+    # own volume first, delivered after, retried until the node accepts it. It is
+    # started before the runtime so anything a previous process left undelivered
+    # — the settlement report of a turn this sandbox was killed in the middle of,
+    # most of all — is on its way before the first new prompt arrives.
+    outbox = Outbox(config.space_id, send, call_creature)
+    outbox.start()
+
+    runtime = CrewRuntime(
+        config.space_id, send, llm_proxy, call_creature, await_result, outbox
+    )
 
     async def on_update(key: str, data: dict) -> None:
         """Everything the project's creatures push to this bridge."""
@@ -112,11 +123,23 @@ async def _run() -> int:
     serve = asyncio.create_task(client.run())
 
     async def announce() -> None:
-        """Tell the project its runtime is up, once connected."""
+        """Tell the project its runtime is up, once connected.
+
+        This is also what asks for the work: the platform holds every prompt in
+        a durable inbox, and a bridge announcing itself is what makes it replay
+        whatever nobody has acknowledged. So a turn sent while this sandbox was
+        asleep arrives moments after it wakes, rather than being a turn somebody
+        was told to send again.
+        """
         if await client.wait_connected(timeout=120):
             try:
-                await send("crew/status", {"ok": True, **runtime.status()})
-                logger.info("announced readiness for %s", config.space_id)
+                result = await send("crew/status", {"ok": True, **runtime.status()})
+                replayed = (result or {}).get("replay") if isinstance(result, dict) else None
+                logger.info(
+                    "announced readiness for %s%s",
+                    config.space_id,
+                    f" (replaying {replayed})" if replayed else "",
+                )
             except Exception:  # noqa: BLE001 - readiness is reported, not required
                 logger.exception("could not announce readiness")
 
@@ -139,6 +162,11 @@ async def _run() -> int:
 
     await stop.wait()
     logger.info("shutting down")
+    # One last chance to hand over what is already produced. Whatever does not
+    # go now stays on disk and is replayed by the next process, so the bound is
+    # a courtesy rather than a deadline anything depends on.
+    await outbox.drain(timeout=15)
+    await outbox.close()
     await llm_proxy.close()
     await client.close()
     serve.cancel()

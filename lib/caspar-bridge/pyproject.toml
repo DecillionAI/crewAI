@@ -21,3 +21,18 @@ path = "src/decillion_caspar_bridge/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/decillion_caspar_bridge"]
+
+[tool.pytest.ini_options]
+# `pythonpath` rather than an editable install on purpose. The package declares
+# `crewai`, which pins the interpreter, so `pip install -e .` refuses on a host
+# whose Python is outside that range — while the bridge's own modules import
+# crewai lazily and its tests never need it. Making the suite runnable was
+# otherwise a matter of guessing two pytest flags, which is why it was reported
+# as "not runnable on this host".
+#
+# Naming a config file here also fixes pytest's rootdir at this package, so
+# collection stops looking for conftest.py in the crewAI workspace above (whose
+# own conftest imports test dependencies this package does not have).
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"

@@ -22,11 +22,15 @@ def test_a_prompt_with_no_agents_answers_instead_of_failing_silently():
         )
     )
     actions = [payload for action, payload in sent if action == "crew/message"]
-    assert [a["kind"] for a in actions] == ["answer", "usage", "run-terminal"]
-    assert actions[0]["spaceId"] == "space-1"
+    # The acknowledgement comes FIRST, and before anything slow: it is what
+    # claims the queued prompt AND what takes the payer's slice, so a run that
+    # cannot be funded stops before it builds a tool or calls a model.
+    assert [a["kind"] for a in actions] == ["run-ack", "answer", "usage", "run-terminal"]
+    assert actions[0]["runId"] == "r1"
+    assert actions[1]["spaceId"] == "space-1"
     # Nothing ran, so the meter is told zero rather than left to time the
     # payer's authorization out.
-    assert actions[1]["promptTokens"] == 0
+    assert actions[2]["promptTokens"] == 0
 
 
 def test_an_empty_prompt_is_dropped_rather_than_run():
@@ -534,3 +538,113 @@ def test_missing_handoff_billing_is_visible_in_the_parent_trail():
     assert notice["kind"] == "step"
     assert notice["status"] == "failed"
     assert "billing pool" in notice["text"]
+
+
+def test_the_work_record_survives_the_sandbox_being_replaced(tmp_path, monkeypatch):
+    """A sleeping machine is a pause, not amnesia.
+
+    `crew/work` used to be answered from an in-memory deque alone, so every
+    sandbox — which sleeps after five idle minutes — came back having forgotten
+    everything its agents had done.
+    """
+    monkeypatch.setenv("DECILLION_STATE_DIR", str(tmp_path / "state"))
+    dying = _runtime([])
+    dying._save_work_record(
+        {"runId": "r1", "agentProgramId": "a1", "status": "done", "startedAt": 1.0}
+    )
+    dying._save_work_record(
+        {"runId": "r2", "agentProgramId": "a2", "status": "done", "startedAt": 2.0}
+    )
+
+    # The sandbox is terminated and a new one comes up on the same volume.
+    reborn = _runtime([])
+    assert [row["runId"] for row in reborn.work()] == ["r2", "r1"]
+
+
+def test_an_answered_question_is_acknowledged_so_the_platform_can_retire_it():
+    """The platform holds an answered question until the runtime says it landed.
+
+    Publishing an answer and removing the question at the same time is what lost
+    both when the bridge had already gone.
+    """
+    sent = []
+    runtime = _runtime(sent)
+    runtime._loop = asyncio.new_event_loop()
+    try:
+        runtime._acknowledge_question("q-1")
+        # Scheduled onto the loop the socket lives on; run it to completion.
+        runtime._loop.run_until_complete(asyncio.sleep(0))
+    finally:
+        runtime._loop.close()
+    # With no outbox this posts directly; with one it is durable. Either way the
+    # acknowledgement carries the question it is for.
+    posted = [payload for action, payload in sent if action == "crew/message"]
+    assert any(p.get("kind") == "question-ack" and p.get("questionId") == "q-1" for p in posted)
+
+
+def test_run_events_go_through_the_outbox_when_there_is_one(tmp_path, monkeypatch):
+    """With an outbox, nothing a run produces is only in memory."""
+    monkeypatch.setenv("DECILLION_STATE_DIR", str(tmp_path / "state"))
+    from decillion_caspar_bridge.outbox import Outbox
+
+    async def refuse(action, payload):
+        raise RuntimeError("the node is not reachable")
+
+    async def main():
+        outbox = Outbox("space-1", refuse)
+        runtime = CrewRuntime("space-1", refuse, outbox=outbox)
+        await runtime.handle_prompt({"runId": "r1", "prompt": "do the thing", "agents": []})
+        return outbox
+
+    outbox = asyncio.run(main())
+    # The node refused every delivery and not one event was lost: the
+    # acknowledgement, the answer, the usage report and the terminal event are
+    # all on disk for the next process to send.
+    assert outbox.pending == 4
+
+
+def test_a_run_the_platform_refuses_to_fund_never_starts():
+    """A refusal at the acknowledgement stops the turn before it spends anything.
+
+    The reservation is made by the creature this acknowledgement reaches, so
+    `stop` is the platform saying the payer's pool cannot cover the run. Going
+    ahead would deliver work nobody can be charged for.
+    """
+    sent = []
+
+    async def send(action, payload):
+        sent.append((action, payload))
+        return {"ok": True}
+
+    async def call(action, payload):
+        sent.append((action, payload))
+        return {"ok": False, "stop": True, "error": "this run could not be funded"}
+
+    runtime = CrewRuntime("space-1", send, call=call)
+    asyncio.run(
+        runtime.handle_prompt({"runId": "r1", "prompt": "do the thing", "agents": []})
+    )
+    kinds = [payload.get("kind") for _, payload in sent]
+    assert kinds == ["run-ack"]
+    # No answer, no usage, no terminal event: the platform already closed the run.
+
+
+def test_an_unreachable_platform_is_not_a_refusal():
+    """A failed acknowledgement must not cancel work somebody paid for."""
+    sent = []
+
+    async def send(action, payload):
+        sent.append((action, payload))
+        return {"ok": True}
+
+    async def call(action, payload):
+        raise RuntimeError("the node is not reachable")
+
+    runtime = CrewRuntime("space-1", send, call=call)
+    asyncio.run(
+        runtime.handle_prompt({"runId": "r1", "prompt": "do the thing", "agents": []})
+    )
+    kinds = [payload.get("kind") for _, payload in sent]
+    # The acknowledgement falls back to the durable outbox path and the turn runs.
+    assert kinds[0] == "run-ack"
+    assert "answer" in kinds
