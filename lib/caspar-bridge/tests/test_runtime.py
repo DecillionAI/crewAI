@@ -458,70 +458,30 @@ Thanks @builder!"""
     assert [s["programId"] for s in _handoff_targets(text, specs)] == ["research-1"]
 
 
-def test_server_handoff_quotes_and_launches_a_deterministic_child():
-    sent = []
-    called = []
+def test_an_agents_mention_records_the_referral_and_starts_nobody():
+    """A mention written by an AGENT is a reference, not a request.
 
-    async def send(action, payload):
-        sent.append((action, payload))
-        return {"ok": True}
+    Agents collaborate inside the crew — the lead is CrewAI's manager and its
+    own delegation picks who does each step, within the one turn the person
+    asked for. So an answer naming a colleague is describing work that has
+    already been shared, and launching that colleague again would do it twice.
 
-    async def call(action, payload):
-        called.append((action, payload))
-        if action == "billing/quote":
-            return {"ok": True, "quote": {"quoteId": "quote-child"}}
-        return {"ok": True, "queued": True}
-
-    runtime = CrewRuntime("space-1", send, call=call)
-    record = {
-        "runId": "parent-run",
-        "jobId": "job-1",
-        "threadId": "main",
-        "agentProgramId": "lead-1",
-        "agentName": "Lead",
-    }
-    message = {
-        "serverOrchestrate": True,
-        "rootRunId": "parent-run",
-        "orchestration": {
-            "depth": 0,
-            "maxHops": 6,
-            "payerUserId": "owner-1",
-            "poolId": "pool-1",
-        },
-    }
-    specs = [
-        {"programId": "lead-1", "username": "lead", "name": "Lead"},
-        {"programId": "research-1", "username": "researcher", "name": "Researcher"},
-    ]
-    asyncio.run(
-        runtime._start_handoffs(
-            message, specs, ["lead-1"], record,
-            "@researcher please verify these findings.",
-        )
-    )
-
-    assert [action for action, _payload in called] == ["billing/quote", "crew/prompt"]
-    quote_payload = called[0][1]
-    child_payload = called[1][1]
-    assert quote_payload["requestId"] == child_payload["runId"]
-    assert child_payload["parentRunId"] == "parent-run"
-    assert child_payload["jobId"] == "job-1"
-    assert child_payload["agentProgramId"] == "research-1"
-    assert child_payload["billingAuthorization"] == {
-        "poolId": "pool-1",
-        "payerUserId": "owner-1",
-        "quoteId": "quote-child",
-    }
-    assert sent == []
-
-
-def test_missing_handoff_billing_is_visible_in_the_parent_trail():
+    This used to mint a delegated quote and start a separately billed child
+    run, which is why an answer with no billing pool attached posted "this run
+    has no delegated billing pool for a server-side hand-off" instead of
+    collaborating at all.
+    """
     sent = []
     runtime = _runtime(sent)
+    called = []
+
+    async def _call(action, payload):
+        called.append((action, payload))
+        return {"ok": True}
+
+    runtime._call = _call
     asyncio.run(
-        runtime._start_handoffs(
-            {"serverOrchestrate": True, "orchestration": {}},
+        runtime._note_mentions(
             [
                 {"programId": "lead-1", "username": "lead", "name": "Lead"},
                 {"programId": "research-1", "username": "researcher", "name": "Researcher"},
@@ -531,13 +491,31 @@ def test_missing_handoff_billing_is_visible_in_the_parent_trail():
                 "runId": "parent-run", "jobId": "job-1", "threadId": "main",
                 "agentProgramId": "lead-1", "agentName": "Lead",
             },
-            "@researcher please continue.",
+            "@researcher please verify these findings.",
         )
     )
+
+    # Nothing was quoted and nothing was started.
+    assert called == []
+    # The referral is still visible in the run's trail, and it is not a failure.
     notice = sent[0][1]
     assert notice["kind"] == "step"
-    assert notice["status"] == "failed"
-    assert "billing pool" in notice["text"]
+    assert notice["status"] == "completed"
+    assert "@researcher" in notice["text"]
+
+
+def test_an_answer_naming_nobody_says_nothing():
+    sent = []
+    runtime = _runtime(sent)
+    asyncio.run(
+        runtime._note_mentions(
+            [{"programId": "lead-1", "username": "lead", "name": "Lead"}],
+            ["lead-1"],
+            {"runId": "parent-run", "agentProgramId": "lead-1", "agentName": "Lead"},
+            "All done — no help needed.",
+        )
+    )
+    assert sent == []
 
 
 def test_the_work_record_survives_the_sandbox_being_replaced(tmp_path, monkeypatch):
@@ -648,3 +626,93 @@ def test_an_unreachable_platform_is_not_a_refusal():
     # The acknowledgement falls back to the durable outbox path and the turn runs.
     assert kinds[0] == "run-ack"
     assert "answer" in kinds
+
+
+def test_the_crew_delegating_is_posted_into_the_chat_as_a_mention():
+    """When the lead hands work to a teammate, the project sees it happen.
+
+    Agents collaborate inside a CrewAI hierarchical crew, and that conversation
+    is the interesting part of a multi-agent turn. It is posted as a mention so
+    it reads the way the people on the project talk — and it starts nothing,
+    because the teammate is already doing the work.
+    """
+    from decillion_caspar_bridge.events import CrewEventForwarder
+
+    class _Agent:
+        role = "Lead role"
+
+    class _Event:
+        tool_name = "Delegate work to coworker"
+        tool_args = {"coworker": "Research role", "task": "check the pricing page"}
+        output = ""
+        agent = _Agent()
+
+    seen = []
+    lead = _Agent()
+    forwarder = CrewEventForwarder(
+        lambda kind, payload: seen.append((kind, payload)),
+        "r1",
+        "lead-1",
+        "Lead",
+        actors={id(lead): ("lead-1", "Lead")},
+        handles={"research role": "researcher"},
+    )
+    event = _Event()
+    event.agent = lead
+    forwarder._tool("started", event)
+
+    kinds = [kind for kind, _ in seen]
+    assert kinds == ["toolcall", "answer"]
+    answer = seen[1][1]
+    assert answer["interim"] is True
+    # Addressed by the handle the project uses, not CrewAI's internal role.
+    assert answer["text"] == "@researcher check the pricing page"
+    assert answer["agentProgramId"] == "lead-1"
+
+    # The reply comes back as the teammate's own work; posting the hand-off
+    # again on the way out would read as it happening twice.
+    seen.clear()
+    forwarder._tool("finished", event)
+    assert [kind for kind, _ in seen] == ["toolcall"]
+
+
+def test_a_led_turn_reports_what_each_agent_spent():
+    """One run, several agents — and every creator is owed for their own.
+
+    A led turn is a single billed run under the lead, but the work inside it is
+    done by whichever teammates the lead delegated to. Pricing the whole fee as
+    the lead's minutes would pay the lead's creator for everybody's work.
+    """
+    from decillion_caspar_bridge.events import CrewEventForwarder
+
+    class _Agent:
+        def __init__(self, role):
+            self.role = role
+
+    class _Task:
+        def __init__(self, agent):
+            self.description = "do the thing"
+            self.agent = agent
+
+    designer, researcher = _Agent("Designer"), _Agent("Researcher")
+    forwarder = CrewEventForwarder(
+        lambda kind, payload: None,
+        "r1",
+        "lead-1",
+        "Lead",
+        actors={id(designer): ("design-1", "Designer"), id(researcher): ("research-1", "Researcher")},
+    )
+
+    one, two = _Task(designer), _Task(researcher)
+    forwarder._step("started", one)
+    forwarder._step("completed", one)
+    forwarder._step("started", two)
+    forwarder._step("failed", two)
+
+    split = forwarder.agent_runtime_ms()
+    assert set(split) == {"design-1", "research-1"}
+    assert all(ms >= 0 for ms in split.values())
+
+    # A task nobody is credited with is not billed to anybody.
+    forwarder._step("started", _Task(_Agent("Unknown")))
+    assert "" not in forwarder.agent_runtime_ms()

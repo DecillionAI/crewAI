@@ -503,7 +503,7 @@ class CrewRuntime:
                 )
                 record["status"] = "done"
                 record["output"] = output
-                await self._start_handoffs(message, specs, selected, record, output)
+                await self._note_mentions(specs, selected, record, output)
             except Exception as exc:  # noqa: BLE001 - a failed turn is reported, not raised
                 logger.exception("run %s failed", run_id)
                 record["status"] = "failed"
@@ -543,6 +543,10 @@ class CrewRuntime:
                         "runtimeMs": int(max(0.0, finished_at - started_at) * 1000),
                         "promptTokens": int(usage.get("promptTokens") or 0),
                         "completionTokens": int(usage.get("completionTokens") or 0),
+                        # What each agent spent. A led turn is one run, but the
+                        # work inside it is done by whichever teammates the lead
+                        # delegated to, and their creators are owed for it.
+                        "agents": usage.get("agents") or [],
                         "success": record.get("status") == "done",
                     },
                 )
@@ -757,6 +761,17 @@ class CrewRuntime:
             id(agent): (pid, str(by_id.get(pid, {}).get("name") or ""))
             for pid, agent in roster.items()
         }
+        # CrewAI addresses a coworker by ROLE, and the project's chat addresses
+        # one by @handle. Both spellings map to the same agent here so a
+        # delegation can be posted the way the project talks.
+        handles: dict[str, str] = {}
+        for pid, spec in by_id.items():
+            handle = str(spec.get("username") or "").lstrip("@")
+            if not handle:
+                continue
+            for spelling in (spec.get("role"), spec.get("name"), handle):
+                if spelling:
+                    handles[str(spelling).strip().lower()] = handle
         sources = [crew, *getattr(crew, "tasks", []), *roster.values()]
         forwarder = CrewEventForwarder(
             emit,
@@ -765,6 +780,7 @@ class CrewRuntime:
             str(by_id.get(selected[0], {}).get("name") or ""),
             sources=sources,
             actors=actors,
+            handles=handles,
         )
         forwarder.register()
 
@@ -777,6 +793,13 @@ class CrewRuntime:
             # Event handlers are global inside CrewAI. Tear this run's handlers
             # down before another turn starts, then drain every event already
             # emitted so the answer cannot overtake its final completed step.
+            # Read the per-agent split BEFORE tearing down: it is what makes a
+            # led turn pay every agent that worked on it, not only the lead
+            # whose name the run carries.
+            usage["agents"] = [
+                {"programId": pid, "runtimeMs": ms}
+                for pid, ms in forwarder.agent_runtime_ms().items()
+            ]
             forwarder.unregister()
             await ordered.close()
         text = getattr(result, "raw", None) or str(result)
@@ -799,115 +822,52 @@ class CrewRuntime:
         )
         return text
 
-    async def _start_handoffs(
+    async def _note_mentions(
         self,
-        message: dict[str, Any],
         specs: list[dict[str, Any]],
         selected: list[str],
         record: dict[str, Any],
         answer: str,
     ) -> None:
-        """Launch explicitly mentioned teammates as separately billed child runs.
+        """Record the teammates an answer named — without starting any of them.
 
-        Both calls use routes fixed in the project's bridge grant. The quote is
-        delegated against the owner's existing pool; the child prompt is then
-        accepted by the server and published back to this runtime. No browser,
-        private key, or client-maintained task board participates.
+        A mention written by an AGENT is a reference, not a request. Agents
+        collaborate inside the crew: the lead is CrewAI's `manager_agent` and
+        CrewAI's own delegation picks who does each step, all within the one
+        turn the person asked for. So an answer that names a colleague is
+        describing work that has already been shared, and re-launching that
+        colleague as a fresh run would do it a second time.
+
+        Mentions written by a PERSON are the opposite and still start agents:
+        the app sends them as the turn's seeds. That asymmetry is the whole
+        rule — a person addresses an agent, agents address each other inside
+        the crew.
+
+        This used to launch a separately billed child run per mention, which is
+        why the runtime needed a delegated billing pool and why an answer with
+        no pool attached posted "this run has no delegated billing pool for a
+        server-side hand-off" instead of collaborating.
         """
-        if message.get("serverOrchestrate") is not True:
-            return
         targets = _handoff_targets(answer, specs, set(selected))
         if not targets:
             return
-
-        orchestration = dict(message.get("orchestration") or {})
-        depth = max(0, int(orchestration.get("depth") or 0))
-        max_hops = min(_MAX_HANDOFF_DEPTH, max(1, int(orchestration.get("maxHops") or _MAX_HANDOFF_DEPTH)))
-        payer = str(orchestration.get("payerUserId") or "")
-        pool_id = str(orchestration.get("poolId") or "")
-        owner_program_id = str(record.get("agentProgramId") or "")
-        owner_name = str(record.get("agentName") or "")
-        if depth >= max_hops:
-            await self._handoff_notice(record, "Agent hand-off depth limit reached.")
-            return
-        if self._call is None or not payer or not pool_id:
-            await self._handoff_notice(
-                record,
-                "A teammate was mentioned, but this run has no delegated billing pool for a server-side hand-off.",
-            )
-            return
-
-        job_id = str(record.get("jobId") or record.get("runId") or "")
-        root_run_id = str(message.get("rootRunId") or record.get("runId") or "")
-        for target in targets:
-            target_id = str(target.get("programId") or "")
-            target_name = str(target.get("name") or target.get("username") or target_id)
-            child_id = hashlib.sha256(
-                f"{record.get('runId')}\0{target_id}".encode("utf-8")
-            ).hexdigest()[:32]
-            try:
-                quote_result = await self._call(
-                    "billing/quote",
-                    {
-                        "requestId": child_id,
-                        "kind": "agent",
-                        "resourceId": target_id,
-                        "projectId": self._space_id,
-                        "payerUserId": payer,
-                        "estimate": {
-                            "runtimeMs": 60_000,
-                            "sandboxMs": 300_000,
-                            "inputTokens": 200_000,
-                            "outputTokens": 8_000,
-                        },
-                    },
-                )
-                if quote_result.get("ok") is False:
-                    raise RuntimeError(str(quote_result.get("error") or "delegated quote was refused"))
-                quote = quote_result.get("quote") or {}
-                quote_id = str(quote.get("quoteId") or "")
-                if not quote_id:
-                    raise RuntimeError("delegated quote returned no quote id")
-
-                child_orchestration = {
-                    **orchestration,
-                    "depth": depth + 1,
-                    "maxHops": max_hops,
-                    "payerUserId": payer,
-                    "poolId": pool_id,
-                }
-                handle = str(target.get("username") or "").lstrip("@")
-                prompt_result = await self._call(
-                    "crew/prompt",
-                    {
-                        "runId": child_id,
-                        "jobId": job_id,
-                        "parentRunId": str(record.get("runId") or ""),
-                        "rootRunId": root_run_id,
-                        "spaceId": self._space_id,
-                        "threadId": str(record.get("threadId") or "main"),
-                        "prompt": (
-                            f"Handoff from {owner_name or owner_program_id}:\n\n{answer}\n\n"
-                            f"Complete the work addressed to @{handle or target_name}."
-                        ),
-                        "agentProgramId": target_id,
-                        "targetAgentId": target_id,
-                        "mentions": [{"programId": target_id, "id": target_id, "name": target_name, "handle": handle}],
-                        "self": {"programId": target_id, "id": target_id, "name": target_name, "handle": handle},
-                        "serverOrchestrate": True,
-                        "orchestration": child_orchestration,
-                        "billingAuthorization": {
-                            "poolId": pool_id,
-                            "payerUserId": payer,
-                            "quoteId": quote_id,
-                        },
-                    },
-                )
-                if prompt_result.get("ok") is False:
-                    raise RuntimeError(str(prompt_result.get("error") or "child prompt was refused"))
-            except Exception as exc:  # noqa: BLE001 - one branch must not cancel siblings
-                logger.exception("handoff from %s to %s failed", record.get("runId"), target_id)
-                await self._handoff_notice(record, f"Handoff to {target_name} could not start: {exc}")
+        named = ", ".join(
+            "@" + str(t.get("username") or t.get("name") or t.get("programId") or "").lstrip("@")
+            for t in targets
+        )
+        await self._post_reliably(
+            "step",
+            {
+                "runId": str(record.get("runId") or ""),
+                "jobId": str(record.get("jobId") or ""),
+                "threadId": str(record.get("threadId") or "main"),
+                "agentProgramId": str(record.get("agentProgramId") or ""),
+                "agentName": str(record.get("agentName") or ""),
+                "status": "completed",
+                "text": f"Referred to {named} — the crew works this out together, "
+                        "so nothing was started separately.",
+            },
+        )
 
     async def _handoff_notice(self, record: dict[str, Any], text: str) -> None:
         await self._post_reliably(

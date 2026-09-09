@@ -11,16 +11,26 @@ The mapping to Decillion's signal vocabulary is one-to-one:
     task started/ended   → kind=step
     agent finished       → kind=step   (the run's answer is posted separately)
 
-`kind=answer` is deliberately NOT emitted here. The runtime posts exactly one
-answer per turn, after the crew returns, because the platform's rule is one
-writer per record — two paths writing the same row is how a transcript ends up
-with duplicates nobody can reconcile.
+    delegation           → kind=answer (interim)
+
+The run's FINAL `kind=answer` is deliberately not emitted here. The runtime
+posts exactly one of those per turn, after the crew returns, because the
+platform's rule is one writer per record — two paths writing the same row is how
+a transcript ends up with duplicates nobody can reconcile.
+
+The interim answer is a different record and is the point of the crew being
+visible at all: when the lead hands a piece of work to a teammate, that is a
+conversation between two agents, and it belongs in the chat where the people on
+the project can read it. It is written as a mention of the teammate, and a
+mention written by an agent never starts anything — agents collaborate inside
+the crew, and only a person's mention launches a run.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Iterable, Mapping
 from typing import Any, Callable
 
@@ -47,6 +57,7 @@ class CrewEventForwarder:
         *,
         sources: Iterable[Any] = (),
         actors: Mapping[int, tuple[str, str]] | None = None,
+        handles: Mapping[str, str] | None = None,
     ) -> None:
         self._emit = emit
         self._run_id = run_id
@@ -54,6 +65,18 @@ class CrewEventForwarder:
         self._agent_name = agent_name
         self._source_ids = {id(source) for source in sources if source is not None}
         self._actors = dict(actors or {})
+        # CrewAI names a coworker by ROLE; the project's chat names one by
+        # @handle. Delegation is posted as chat, so it needs the translation —
+        # without it an agent would address a teammate by a name nobody in the
+        # project uses.
+        self._handles = {str(k).strip().lower(): str(v) for k, v in (handles or {}).items()}
+        # How long each agent actually worked, keyed by program id. A led turn
+        # is ONE run whose work is done by whichever teammates the lead
+        # delegated to, so without this the whole fee would be priced as the
+        # lead's minutes and every other agent's creator would earn nothing for
+        # work their agent did.
+        self._agent_ms: dict[str, float] = {}
+        self._task_open: dict[int, tuple[str, float]] = {}
         self._registered: list[tuple[type[Any], Any]] = []
         self._bus: Any = None
 
@@ -166,6 +189,27 @@ class CrewEventForwarder:
 
     # ── emitters ─────────────────────────────────────────────────────────
 
+    def agent_runtime_ms(self) -> dict[str, int]:
+        """What each agent spent on this run, in milliseconds."""
+        return {pid: int(ms) for pid, ms in self._agent_ms.items() if pid and ms > 0}
+
+    def _clock(self, state: str, task: Any, actor_program_id: str) -> None:
+        """Time one task against the agent that actually executed it."""
+        if task is None:
+            return
+        key = id(task)
+        now = time.monotonic()
+        if state == "started":
+            self._task_open[key] = (actor_program_id, now)
+            return
+        opened = self._task_open.pop(key, None)
+        if opened is None:
+            return
+        pid, began = opened
+        pid = pid or actor_program_id
+        if pid:
+            self._agent_ms[pid] = self._agent_ms.get(pid, 0.0) + max(0.0, now - began) * 1000.0
+
     def _step(self, state: str, task: Any, detail: Any = None) -> None:
         description = _text(getattr(task, "description", "")) if task else ""
         payload = {
@@ -184,7 +228,45 @@ class CrewEventForwarder:
             payload["actorProgramId"] = actor_program_id
         if actor_name:
             payload["actorName"] = actor_name
+        self._clock(state, task, actor_program_id)
         self._emit("step", payload)
+
+    #: CrewAI's own agent-to-agent tools. These are the crew collaborating, and
+    #: each call is one agent addressing another — which is a chat message, not
+    #: just a tool invocation.
+    _DELEGATION_TOOLS = {
+        "delegate work to coworker": "asked",
+        "ask question to coworker": "asked",
+    }
+
+    def _delegation(self, event: Any, actor_name: str) -> None:
+        """Post one agent addressing another into the project's chat.
+
+        Rendered as a mention so it reads the way the people on the project
+        talk to each other — and it starts nothing, because the teammate is
+        already doing this work inside the crew.
+        """
+        args = _jsonable(getattr(event, "tool_args", None))
+        if not isinstance(args, dict):
+            return
+        coworker = _text(args.get("coworker") or args.get("agent") or "").strip()
+        task = _text(args.get("task") or args.get("question") or "").strip()
+        if not coworker:
+            return
+        handle = self._handles.get(coworker.strip().lower(), "")
+        addressed = "@" + handle if handle else coworker
+        text = f"{addressed} {task}".strip() if task else f"{addressed} —"
+        actor_program_id, _ = self._actor(getattr(event, "agent", None) or event)
+        self._emit(
+            "answer",
+            {
+                "runId": self._run_id,
+                "agentProgramId": actor_program_id or self._agent_program_id,
+                "agentName": actor_name or self._agent_name,
+                "interim": True,
+                "text": text,
+            },
+        )
 
     def _tool(self, state: str, event: Any) -> None:
         payload = {
@@ -203,6 +285,10 @@ class CrewEventForwarder:
         if actor_name:
             payload["actorName"] = actor_name
         self._emit("toolcall", payload)
+        # Only on the way in: the reply comes back as the teammate's own work,
+        # and posting the hand-off twice would read as it happening twice.
+        if state == "started" and str(payload["toolName"]).strip().lower() in self._DELEGATION_TOOLS:
+            self._delegation(event, actor_name)
 
 
 def _actor_of(source: Any) -> str:
