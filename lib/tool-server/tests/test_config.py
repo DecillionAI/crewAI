@@ -1,6 +1,6 @@
 """Configuration comes from the sandbox, and the token never leaks into logs."""
 
-from decillion_caspar_bridge.config import load_config
+from decillion_tool_server.config import load_config
 
 
 def test_topic_defaults_to_the_space(monkeypatch):

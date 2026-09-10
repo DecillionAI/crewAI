@@ -1,5 +1,5 @@
 [project]
-name = "decillion-caspar-bridge"
+name = "decillion-tool-server"
 dynamic = ["version"]
 description = "Runs a Decillion project's agents as a CrewAI crew inside its Modal sandbox, connected to the Caspar node over the gateway subscription channel."
 readme = "README.md"
@@ -10,17 +10,17 @@ dependencies = [
 ]
 
 [project.scripts]
-decillion-caspar-bridge = "decillion_caspar_bridge.__main__:main"
+decillion-tool-server = "decillion_tool_server.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
-path = "src/decillion_caspar_bridge/__init__.py"
+path = "src/decillion_tool_server/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/decillion_caspar_bridge"]
+packages = ["src/decillion_tool_server"]
 
 [tool.pytest.ini_options]
 # `pythonpath` rather than an editable install on purpose. The package declares

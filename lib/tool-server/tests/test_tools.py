@@ -17,7 +17,7 @@ import sys
 
 import pytest
 
-from decillion_caspar_bridge import tools
+from decillion_tool_server import tools
 
 
 def test_a_path_stays_inside_the_project(tmp_path, monkeypatch):
@@ -43,74 +43,10 @@ def test_output_is_clipped_with_the_size_it_dropped():
     assert tools._clip("short") == "short"
 
 
-def test_declared_args_reads_a_tools_own_list_shape():
-    command = {
-        "name": "write",
-        "args": [
-            {"name": "repo", "description": "owner/name"},
-            {"name": "path", "description": "path in the repository"},
-        ],
-    }
-    assert tools._declared_args(command) == [
-        ("repo", "owner/name"),
-        ("path", "path in the repository"),
-    ]
-
-
-def test_declared_args_reads_the_registrys_map_shape():
-    """The synthetic `help` entry declares a map, not a list."""
-    command = {"name": "help", "args": {"command": {"type": "STRING", "desc": "a command name"}}}
-    assert tools._declared_args(command) == [("command", "a command name")]
-
-
-def test_a_command_with_no_arguments_declares_none():
-    assert tools._declared_args({"name": "status"}) == []
-    assert tools._declared_args({"name": "status", "args": None}) == []
-
-
-def test_tool_names_are_callable_identifiers():
-    assert tools._tool_slug("GitHub", "setShared") == "github_setshared"
-    assert tools._tool_slug("Zapier ✨", "run") == "zapier_run"
-    # Never empty: a model cannot call a tool with no name.
-    assert tools._tool_slug("", "") == "tool"
-
-
-def test_a_creatures_reply_drops_the_envelope():
-    rendered = tools._render(
-        {"ok": True, "namespace": "github", "action": "invoke", "function": "status", "connected": True}
-    )
-    assert "connected" in rendered
-    assert "namespace" not in rendered
-    # A reply that was ALL envelope still says something.
-    assert tools._render({"ok": True, "namespace": "github"}) == "Done."
-
-
-def test_build_tools_survives_a_sandbox_without_crewai():
-    """A runtime that cannot build tools still runs the turn.
-
-    crewai is absent here, so every builder raises on import. The contract is
-    that `build_tools` reports an empty set rather than propagating — an agent
-    with no tools is degraded, an agent whose turn raised is broken.
-    """
-    assert tools.build_tools([{"action": "tool/1@global", "commands": []}], None, None) == []
-
-
 def test_the_catalogue_can_be_turned_off(monkeypatch):
     monkeypatch.setattr(tools, "_CATALOG_ENABLED", False)
     monkeypatch.setattr(tools, "_CATALOG_CACHE", None)
     assert tools.catalog_tools() == []
-
-
-def test_a_command_a_person_must_run_is_not_offered_to_agents():
-    """`agents: false` is how a tool keeps a command to people.
-
-    Only an explicit false excludes: a registry entry written before the flag
-    existed says nothing, and must keep every command it declared rather than
-    silently losing them all.
-    """
-    assert tools._agent_may_call({"name": "read"}) is True
-    assert tools._agent_may_call({"name": "connect", "agents": False}) is False
-    assert tools._agent_may_call({"name": "read", "agents": True}) is True
 
 
 def test_a_tool_missing_its_required_key_is_not_offered():
@@ -200,25 +136,6 @@ def test_a_tool_whose_schema_a_provider_refuses_is_not_offered():
     assert tools._unsupported_schema(object()) == []
 
 
-def test_the_question_tool_is_only_built_for_a_real_turn():
-    """A question has to name its run and its author, so it needs the turn.
-
-    Without one there is nothing to attribute the question to and nothing for
-    the answer to come back to, so the tool is simply not offered.
-    """
-    calls = []
-
-    async def call(action, payload):  # pragma: no cover - never reached here
-        calls.append((action, payload))
-        return {}
-
-    # crewai is absent in this environment, so every builder fails and the list
-    # is empty either way — what is asserted is that asking for a turn does not
-    # raise, and that omitting one is equally safe.
-    assert tools.build_tools([], call, None) == []
-    assert tools.build_tools([], call, None, {"runId": "r-1"}) == []
-
-
 def test_the_install_target_is_set_up_and_put_back(tmp_path, monkeypatch):
     """`uv add` needs a project to edit and a venv to install into.
 
@@ -239,74 +156,9 @@ def test_the_install_target_is_set_up_and_put_back(tmp_path, monkeypatch):
     assert "UV_PROJECT_ENVIRONMENT" not in os.environ
 
 
-def test_the_question_tool_needs_somewhere_to_send_the_answer():
-    """Without a way to WAIT for an answer there is no question tool.
-
-    The answer arrives under an id the creature names, long after the call that
-    asked returned — so a runtime with no `await_result` cannot receive one, and
-    offering the tool would hang the agent instead of answering it.
-    """
-
-    async def call(action, payload):  # pragma: no cover - never reached
-        return {}
-
-    assert tools.build_tools([], call, None, {"runId": "r-1"}) == []
-    assert tools.build_tools([], call, None, {"runId": "r-1"}, None) == []
-
-
-# ── asking the project ───────────────────────────────────────────────────────
-
-
 def _timeout():
     from concurrent.futures import TimeoutError as FuturesTimeout
 
     raise FuturesTimeout()
 
 
-def test_a_question_that_never_reaches_the_project_says_so_at_once():
-    """The failure the split exists for.
-
-    An unrouted action is delivered to the grant's default handler, which records
-    something and never replies — so the accept never lands. That used to be a
-    quarter of an hour of silence mid-run; it is now an answer the agent can act
-    on straight away.
-    """
-    out = tools.ask_question(_timeout, lambda answer_id: pytest.fail("must not wait"))
-    assert "did not accept the question" in out
-    assert "Continue without asking" in out
-
-
-def test_a_question_nobody_answers_lets_the_run_finish():
-    """Different from the above, and it must read differently.
-
-    Nobody answering is ordinary — a project with nobody watching — so the agent
-    is told to decide and to say that it was unconfirmed, rather than that
-    something is broken.
-    """
-    out = tools.ask_question(lambda: {"ok": True, "answerId": "a-1"}, lambda _id: _timeout())
-    assert "Nobody answered in time" in out
-    assert "best judgement" in out
-
-
-def test_an_answer_comes_back_to_the_agent():
-    seen = {}
-
-    def wait_for(answer_id):
-        seen["id"] = answer_id
-        return {"ok": True, "answer": "Playful"}
-
-    out = tools.ask_question(lambda: {"ok": True, "answerId": "a-42"}, wait_for)
-    # It waits on the id the CREATURE named, not on the one the call used.
-    assert seen["id"] == "a-42"
-    assert out == "The project answered: Playful"
-
-
-def test_a_refused_question_reports_the_reason():
-    out = tools.ask_question(lambda: {"ok": False, "error": "not a member"}, lambda _id: {})
-    assert "not a member" in out
-
-
-def test_an_acceptance_with_no_answer_id_is_not_waited_on():
-    """Without an id there is nothing to wait for, and waiting anyway hangs."""
-    out = tools.ask_question(lambda: {"ok": True}, lambda _id: pytest.fail("must not wait"))
-    assert "could not register the question" in out

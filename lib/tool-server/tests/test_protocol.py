@@ -4,7 +4,7 @@ import struct
 
 import pytest
 
-from decillion_caspar_bridge.protocol import (
+from decillion_tool_server.protocol import (
     ACK_FRAME,
     decode_frame,
     encode_request,

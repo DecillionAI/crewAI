@@ -246,175 +246,10 @@ def workspace_tools() -> list[Any]:
 # ── the project's Caspar tools ───────────────────────────────────────────────
 
 
-def _tool_slug(*parts: str) -> str:
-    """A tool name a model can call: letters, digits and underscores only."""
-    joined = "_".join(str(p or "").strip() for p in parts if str(p or "").strip())
-    # Runs are collapsed, not replaced one-for-one: a name ending in punctuation
-    # would otherwise meet the separator and produce a doubled underscore, and
-    # two tools whose names differ only there would look like different tools to
-    # a person reading the trail and the same one to nobody.
-    slug = re.sub(r"_+", "_", re.sub(r"[^0-9a-zA-Z_]+", "_", joined)).strip("_").lower()
-    return slug or "tool"
-
-
-def _declared_args(command: dict[str, Any]) -> list[tuple[str, str]]:
-    """One command's parameters, in either shape the registry stores them.
-
-    A tool declares `args` as a list of `{name, description}`; the synthetic
-    `help` command the registry adds declares a map of `name -> {desc}`. Both
-    are read here rather than normalised on the node, because the node's copy
-    is what the client also renders and changing it would change that too.
-    """
-    args = command.get("args")
-    out: list[tuple[str, str]] = []
-    if isinstance(args, list):
-        for item in args:
-            if isinstance(item, dict) and item.get("name"):
-                out.append((str(item["name"]), str(item.get("description") or item.get("desc") or "")))
-            elif isinstance(item, str) and item:
-                out.append((item, ""))
-    elif isinstance(args, dict):
-        for name, spec in args.items():
-            if not name:
-                continue
-            if isinstance(spec, dict):
-                out.append((str(name), str(spec.get("desc") or spec.get("description") or "")))
-            else:
-                out.append((str(name), ""))
-    return out
-
-
-def _agent_may_call(command: dict[str, Any]) -> bool:
-    """Whether a registered command is one an AGENT may run.
-
-    The tool says so. `agents: false` marks the commands that manage the
-    connection rather than use it — starting a sign-in, which answers with a URL
-    only a person can open, or revoking a credential a person granted. Only an
-    explicit false excludes: a command that says nothing is ordinary work, and a
-    registry written before the flag existed must not lose everything it
-    declared.
-    """
-    return command.get("agents") is not False
-
-
-def creature_tools(
-    specs: list[dict[str, Any]],
-    call: Callable[[str, dict], Awaitable[dict]],
-    loop: asyncio.AbstractEventLoop,
-    timeout: float = 120.0,
-) -> list[Any]:
-    """The project's attached Caspar tools, one CrewAI tool per command.
-
-    `call` is the bridge's request/response call to a creature and `loop` is the
-    bridge's event loop: CrewAI runs a turn on a worker thread, so each call is
-    handed to the loop and waited on from that thread. Doing it the other way —
-    a fresh event loop per call — would open a second connection to the node for
-    every tool an agent uses.
-    """
-    from pydantic import Field, create_model
-
-    tools: list[Any] = []
-    for spec in specs or []:
-        action = str(spec.get("action") or "").strip()
-        if not action:
-            # A tool with no route is one this runtime cannot reach — a metered
-            # container tool, which is executed by the node and not by us. It is
-            # skipped rather than offered and failed.
-            continue
-        tool_name = str(spec.get("name") or "tool")
-        for command in spec.get("commands") or []:
-            if not isinstance(command, dict):
-                continue
-            fn = str(command.get("name") or "").strip()
-            if not fn or fn == "help":
-                # `help` describes the tool to a person typing in chat. An agent
-                # has the same information in these descriptions already.
-                continue
-            if not _agent_may_call(command):
-                continue
-            declared = _declared_args(command)
-            fields: dict[str, Any] = {
-                name: (str, Field(default="", description=desc or f"{name} for {tool_name} {fn}"))
-                for name, desc in declared
-            }
-            args_schema = create_model(f"{_tool_slug(tool_name, fn)}_args", **fields)  # type: ignore[call-overload]
-
-            described = str(command.get("description") or f"The {tool_name} {fn} command.")
-            tools.append(
-                _CreatureTool(
-                    name=_tool_slug(tool_name, fn),
-                    description=f"{tool_name}: {described}",
-                    args_schema=args_schema,
-                    action=action,
-                    function=fn,
-                    call=call,
-                    loop=loop,
-                    timeout=timeout,
-                )
-            )
-    return tools
-
-
 try:  # pragma: no cover - exercised only where crewai is installed
     from crewai.tools import BaseTool as _BaseTool
 except Exception:  # noqa: BLE001 - the pure helpers above must import without crewai
     _BaseTool = object  # type: ignore[assignment,misc]
-
-
-class _CreatureTool(_BaseTool):  # type: ignore[misc,valid-type]
-    """One command of one Caspar tool, callable by an agent.
-
-    The call goes out over the bridge to the tool's own creature, which decides
-    what this project may do — the project id is never sent, because the tool
-    reads it from the bearer token's topic instead. That is the whole
-    authorization story, and it means a compromised runtime cannot reach another
-    project's connected accounts by asking nicely.
-    """
-
-    action: str = ""
-    function: str = ""
-    call: Any = None
-    loop: Any = None
-    timeout: float = 120.0
-
-    def _run(self, **kwargs: Any) -> str:
-        payload = {"function": self.function, **{k: v for k, v in kwargs.items() if v not in ("", None)}}
-        try:
-            future = asyncio.run_coroutine_threadsafe(self.call(self.action, payload), self.loop)
-            result = future.result(timeout=self.timeout)
-        except Exception as exc:  # noqa: BLE001 - a tool failure is an answer
-            logger.exception("tool %s failed", self.name)
-            return f"Error: {self.name} could not be run: {exc or type(exc).__name__}"
-        if isinstance(result, dict):
-            if result.get("ok") is False:
-                return f"Error: {result.get('error') or 'the tool refused the request'}"
-            # The creature answers with its own fields; handing them back whole
-            # lets the model read whatever the tool chose to report rather than
-            # whatever shape this file happened to anticipate.
-            return _clip(_render(result))
-        return _clip(str(result))
-
-
-def _render(result: dict[str, Any]) -> str:
-    """A creature's reply, as something a model can read.
-
-    JSON, minus the envelope fields that describe the call rather than answer
-    it — an agent reading `"ok": true, "namespace": "github"` learns nothing and
-    pays for the tokens.
-    """
-    import json
-
-    body = {
-        k: v
-        for k, v in result.items()
-        if k not in {"ok", "namespace", "action", "function", "correlationId"}
-    }
-    if not body:
-        return "Done."
-    try:
-        return json.dumps(body, indent=2, default=str)
-    except (TypeError, ValueError):
-        return str(body)
 
 
 # ── asking the people on the project ─────────────────────────────────────────
@@ -435,164 +270,6 @@ QUESTION_ACCEPT_SECONDS = 45.0
 #: one that guesses: every question stops the work and costs somebody's
 #: attention. Past this the tool tells the agent to decide for itself.
 MAX_QUESTIONS_PER_RUN = 4
-
-
-def ask_tool(
-    call: Callable[[str, dict], Awaitable[dict]],
-    await_result: Callable[[str, float], Awaitable[Any]],
-    loop: asyncio.AbstractEventLoop,
-    run_id: str,
-    thread_id: str,
-    agent_program_id: str,
-    agent_name: str = "",
-    ack: Callable[[str], None] | None = None,
-) -> Any:
-    """Let an agent put a question to the project and wait for the answer.
-
-    Some work cannot be finished without a decision only a person can make —
-    which direction to take, whether to publish, the detail nobody wrote down.
-    An agent without this has two options and both are bad: guess, or stop and
-    report that it could not proceed. It guesses.
-
-    The waiting is the mechanism, not a complication of it. The call out to
-    `crew/ask` is a request/response call like any other, and the creature
-    simply does not answer it until a person has: the question is posted into
-    the project's chat, and answering it publishes the result under the same
-    correlation id (see `crew/answer`). So nothing polls, and nothing about a
-    pending question lives in this sandbox — if the machine were replaced, the
-    question would still be in the project's log where a person can see it.
-    """
-    from pydantic import BaseModel, Field
-
-    class AskArgs(BaseModel):
-        question: str = Field(
-            description="The question to put to the people on this project. Ask one thing, "
-            "plainly, and say what you will do with each answer."
-        )
-        options: str = Field(
-            default="",
-            description="Optional. A short list of answers to offer, separated by | — "
-            "use it for a decision between known choices or a yes/no confirmation.",
-        )
-
-    class AskTheProject(_BaseTool):  # type: ignore[misc,valid-type]
-        name: str = "ask_the_project"
-        description: str = (
-            "Ask the people on this project a question and wait for their answer. "
-            "Use it when a decision is genuinely theirs — a choice between directions, "
-            "a confirmation before something irreversible, or a fact you cannot find "
-            "with your other tools. Your question appears in the project's chat and "
-            "this waits for a reply, so ask only what you actually need."
-        )
-        args_schema: type[BaseModel] = AskArgs
-        asked: int = 0
-
-        def _run(self, question: str, options: str = "") -> str:
-            if self.asked >= MAX_QUESTIONS_PER_RUN:
-                return (
-                    "You have already asked this project as much as one turn may ask. "
-                    "Decide with what you have, and say in your answer which assumption "
-                    "you made and why."
-                )
-            self.asked += 1
-            choices = [o.strip() for o in str(options or "").split("|") if o.strip()]
-            payload = {
-                "question": str(question),
-                "options": choices,
-                "runId": run_id,
-                "threadId": thread_id,
-                "agentProgramId": agent_program_id,
-                "agentName": agent_name,
-            }
-            return ask_question(
-                lambda: asyncio.run_coroutine_threadsafe(
-                    call("crew/ask", payload), loop
-                ).result(timeout=QUESTION_ACCEPT_SECONDS),
-                lambda answer_id: asyncio.run_coroutine_threadsafe(
-                    await_result(answer_id, QUESTION_TIMEOUT_SECONDS), loop
-                ).result(timeout=QUESTION_TIMEOUT_SECONDS + 30),
-                ack,
-            )
-
-    return AskTheProject()
-
-
-def ask_question(
-    submit: Callable[[], Any],
-    wait_for: Callable[[str], Any],
-    ack: Callable[[str], None] | None = None,
-) -> str:
-    """Put a question to the project and report what came back.
-
-    TWO waits, and the split is the point.
-    The first is the platform ACCEPTING the question — no person is involved, so
-    it is quick, and it either returns the id the answer will arrive under or it
-    fails. The second is the person.
-
-    Before this was split, a question that never reached the project at all was
-    indistinguishable from one nobody had answered yet: both were a quarter of an
-    hour of silence in the middle of a run, with nothing in the project to show a
-    question had been asked. That is exactly what a missing route did — the
-    gateway delivers an unrouted action to the grant's default handler, which
-    records something and never replies.
-
-    Every outcome is a STRING the agent can act on. A tool that raises here would
-    end the turn; the point of asking is to carry on.
-    """
-    try:
-        accepted = submit()
-    except FuturesTimeout:
-        return (
-            "Error: this project did not accept the question — its runtime may not "
-            "be able to reach the platform's question handler. Continue without "
-            "asking, and say in your answer what you decided without confirmation."
-        )
-    except Exception as exc:  # noqa: BLE001 - a failed ask is an answer
-        logger.exception("could not ask the project")
-        return f"Error: the question could not be put to the project: {exc}"
-
-    if not isinstance(accepted, dict) or accepted.get("ok") is False:
-        reason = (accepted or {}).get("error") if isinstance(accepted, dict) else ""
-        return f"Error: {reason or 'the question was refused by the project'}"
-    answer_id = str(accepted.get("answerId") or "")
-    if not answer_id:
-        return (
-            "Error: this project could not register the question. Continue without "
-            "asking, and say what you decided without confirmation."
-        )
-
-    try:
-        result = wait_for(answer_id)
-    except FuturesTimeout:
-        # Not an error: a project nobody is watching is an ordinary
-        # situation, and the run should finish rather than hold its
-        # authorization open until something else times it out.
-        return (
-            "Nobody answered in time. Continue with your best judgement, and say "
-            "in your answer what you decided and that it was unconfirmed."
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("waiting for an answer failed")
-        return f"Error: the answer never arrived: {exc}"
-    if isinstance(result, dict):
-        # Confirm receipt before doing anything with it. The platform holds an
-        # answered question until the runtime says it arrived — because
-        # publishing an answer to a bridge that had already gone used to retire
-        # the question at the same time, losing both the answer and the only
-        # record that anyone was still owed one.
-        if ack is not None:
-            question_id = str(result.get("questionId") or "")
-            if question_id:
-                try:
-                    ack(question_id)
-                except Exception:  # noqa: BLE001 - the answer still stands
-                    logger.exception("could not acknowledge question %s", question_id)
-        if result.get("ok") is False:
-            return f"Error: {result.get('error') or 'the question was refused'}"
-        answer = str(result.get("answer") or "").strip()
-        if answer:
-            return f"The project answered: {answer}"
-    return "The project gave no answer. Continue with your best judgement."
 
 
 # ── the CrewAI catalogue ─────────────────────────────────────────────────────
@@ -848,53 +525,93 @@ def _missing_env(instance: Any) -> list[str]:
 # ── what one turn is given ───────────────────────────────────────────────────
 
 
-def build_tools(
-    tool_specs: list[dict[str, Any]],
-    call: Callable[[str, dict], Awaitable[dict]] | None,
-    loop: asyncio.AbstractEventLoop | None,
-    turn: dict[str, str] | None = None,
-    await_result: Callable[[str, float], Awaitable[Any]] | None = None,
-    ack_question: Callable[[str], None] | None = None,
-) -> list[Any]:
-    """Everything the agents on this turn can use.
+# ── The server's entry points ────────────────────────────────────────────────
+#
+# The node addresses a tool by NAME and hands it a dict of arguments. It does
+# not know whether that name is a workspace tool or something out of the
+# catalogue, and it should not: which tools exist on a given machine depends on
+# what installed successfully there, which is exactly what `tool_manifest`
+# reports back on announce.
 
-    Ordered deliberately: the project's own machine first, then the tools the
-    project has attached, then asking the people on it, then the general
-    catalogue. A model reads the list in order, and the first ones are those
-    that act on THIS project.
 
-    `turn` identifies the run for the tools that need to say who is speaking —
-    a question has to be attributed to an agent and tied to the run waiting on
-    it, which is not something the tool can find out for itself.
+def _all_tools() -> dict[str, Any]:
+    """Every tool this machine can actually run, by name.
+
+    The project's OWN tools come first and win a name collision. A catalogue
+    tool that happens to be called `FileReadTool` must never shadow the one that
+    reads this project's files — the agent asked about this project.
     """
-    tools: list[Any] = []
-    try:
-        tools.extend(workspace_tools())
-    except Exception:  # noqa: BLE001 - a turn without file tools still runs
-        logger.exception("could not build the project's workspace tools")
-    if call is not None and loop is not None:
-        try:
-            tools.extend(creature_tools(tool_specs, call, loop))
-        except Exception:  # noqa: BLE001
-            logger.exception("could not build the project's Caspar tools")
-        if turn and await_result is not None:
+    out: dict[str, Any] = {}
+    for tool in catalog_tools():
+        name = getattr(tool, "name", "")
+        if name:
+            out[name] = tool
+    for tool in workspace_tools():
+        name = getattr(tool, "name", "")
+        if name:
+            out[name] = tool
+    return out
+
+
+def tool_manifest() -> list[dict[str, Any]]:
+    """What this machine can run, as the node needs to describe it to a model.
+
+    Sent on announce so the node can offer these tools to an agent without
+    asking first — a round trip on the critical path of every first prompt.
+    """
+    manifest: list[dict[str, Any]] = []
+    for name, tool in _all_tools().items():
+        entry: dict[str, Any] = {
+            "name": name,
+            "description": str(getattr(tool, "description", "") or ""),
+            "kind": "sandbox",
+        }
+        schema = getattr(tool, "args_schema", None)
+        if schema is not None:
             try:
-                tools.append(
-                    ask_tool(
-                        call,
-                        await_result,
-                        loop,
-                        turn.get("runId", ""),
-                        turn.get("threadId", "main"),
-                        turn.get("agentProgramId", ""),
-                        turn.get("agentName", ""),
-                        ack_question,
-                    )
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("could not build the project's question tool")
+                entry["parameters"] = schema.model_json_schema()
+            except Exception:  # noqa: BLE001 - a tool with an unreadable schema still runs
+                entry["parameters"] = {"type": "object", "properties": {}}
+        else:
+            entry["parameters"] = {"type": "object", "properties": {}}
+        manifest.append(entry)
+    return manifest
+
+
+def build_catalog() -> list[Any]:
+    """Build the catalogue now. Blocking, so the caller decides which thread pays."""
+    return catalog_tools()
+
+
+def run_tool(name: str, args: dict[str, Any]) -> str:
+    """Run one tool and return what it said.
+
+    Synchronous and blocking — a catalogue tool is ordinary Python and most of
+    them make network calls. The caller runs it on a worker thread.
+
+    A tool that does not exist is an ANSWER, not an exception: the model chose a
+    name, and being told which names are real is something it can act on. It
+    happens most on a machine where an optional tool failed to install, and the
+    difference between "no such tool" and a stack trace is the difference
+    between the agent recovering and the turn ending.
+    """
+    tools = _all_tools()
+    tool = tools.get(name)
+    if tool is None:
+        available = ", ".join(sorted(tools)) or "none"
+        return f"Error: this project's machine has no tool called {name!r}. It has: {available}"
     try:
-        tools.extend(catalog_tools())
-    except Exception:  # noqa: BLE001
-        logger.exception("could not build the CrewAI tool catalogue")
-    return tools
+        result = tool.run(**(args or {}))
+    except TypeError as exc:
+        # Wrong arguments: the model can fix this on the next turn if it is told
+        # what the tool wanted.
+        schema = getattr(tool, "args_schema", None)
+        wanted = ""
+        if schema is not None:
+            try:
+                wanted = ", ".join((schema.model_json_schema().get("properties") or {}).keys())
+            except Exception:  # noqa: BLE001
+                wanted = ""
+        detail = f" It takes: {wanted}." if wanted else ""
+        return f"Error: {name} was called with the wrong arguments ({exc}).{detail}"
+    return _clip(result if isinstance(result, str) else str(result))

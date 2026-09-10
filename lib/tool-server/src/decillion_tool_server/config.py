@@ -1,4 +1,4 @@
-"""What the bridge is, read from the sandbox it runs in.
+"""What this tool server is, read from the sandbox it runs in.
 
 Everything here is written into `/etc/decillion/bridge.env` by the same call
 that created the sandbox (`spaces/create`), which is the only place the
@@ -14,7 +14,12 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class BridgeConfig:
-    """The identity and endpoints one bridge process runs with."""
+    """The identity and endpoints one tool-server process runs with.
+
+    Note what is NOT here any more: a model-proxy port. This process makes no
+    model calls, `llm/chat` is not in its grant's routes, and there is nothing
+    for a provider key to leak through.
+    """
 
     gateway_url: str
     space_id: str
@@ -22,9 +27,13 @@ class BridgeConfig:
     token: str
     crew_home: str
     log_level: str
-    #: Loopback port the platform's model proxy listens on. Configurable only
-    #: so a sandbox image that already uses the default can move it.
-    llm_proxy_port: int
+    #: Where this process keeps what it has not yet delivered. On the project's
+    #: own volume, so an undelivered tool result survives the machine sleeping.
+    state_dir: str
+    #: The pinned revision of the tool catalogue installed on this volume,
+    #: reported on announce so the node can tell an intended install from a
+    #: finished one.
+    runtime_ref: str
 
     @property
     def configured(self) -> bool:
@@ -54,13 +63,6 @@ def load_config() -> BridgeConfig:
         token=os.environ.get("DECILLION_BRIDGE_TOKEN", "").strip(),
         crew_home=os.environ.get("CREWAI_HOME", "/opt/crewai").strip(),
         log_level=os.environ.get("DECILLION_LOG_LEVEL", "INFO").strip().upper(),
-        llm_proxy_port=_port(os.environ.get("DECILLION_LLM_PROXY_PORT"), 8788),
+        state_dir=os.environ.get("DECILLION_STATE_DIR", "/data/.decillion/state").strip(),
+        runtime_ref=os.environ.get("DECILLION_RUNTIME_REF", "").strip(),
     )
-
-
-def _port(raw: str | None, fallback: int) -> int:
-    try:
-        value = int(str(raw or "").strip())
-    except ValueError:
-        return fallback
-    return value if 1 <= value <= 65535 else fallback

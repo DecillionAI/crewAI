@@ -6,7 +6,11 @@ One connection does both directions:
   subscribed to. That is how a creature reaches a program that has no Caspar
   identity of its own.
 * **outbound** — `/gateway/signal` calls, which the node delivers to the
-  creature its grant nominates (`crew/message`).
+  creature its grant nominates (`crew/tool`).
+
+There is no request/response direction any more. This process asks a creature
+for nothing: it reports what a tool did and the node does the rest, so the
+correlation-tracking half of this client went with the agent runtime.
 
 Reconnection is not optional here: a sandbox lives for days, the node restarts,
 and a bridge that gave up would leave a project's agents unreachable with no
@@ -42,10 +46,6 @@ _BACKOFF_CAP = 30.0
 #: node answers gateway actions from state, so this is generous, not tight.
 _REQUEST_TIMEOUT = 30.0
 
-#: How long to wait for a CREATURE's answer (see `call_creature`). This is a
-#: model call, not a state read: it is bounded by the vendor, not by the node.
-_CREATURE_CALL_TIMEOUT = 300.0
-
 
 class CasparBridgeClient:
     """A reconnecting client for the gateway subscription channel."""
@@ -55,14 +55,13 @@ class CasparBridgeClient:
         self._on_update = on_update
         self._socket: websockets.ClientConnection | None = None
         self._pending: dict[str, asyncio.Future] = {}
-        #: Callers waiting on a CREATURE's answer, keyed by the correlation id
-        #: their call carried. Distinct from `_pending`, which tracks the
-        #: node's own transport-level responses: the gateway acknowledges
-        #: delivery immediately, and the creature's answer arrives later as an
-        #: update on this project's topic.
-        self._creature_calls: dict[str, asyncio.Future] = {}
         self._connected = asyncio.Event()
         self._closing = False
+        #: Called after every successful subscribe. A subscription belongs to a
+        #: CONNECTION and does not survive one closing, so a reconnect leaves
+        #: the node believing this machine is gone; announcing again is what
+        #: corrects that, and what replays the backlog.
+        self.on_connected: Callable[[], Awaitable[None]] | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -90,6 +89,12 @@ class CasparBridgeClient:
                     reader = asyncio.create_task(self._read_loop(socket))
                     try:
                         await self._subscribe()
+                        # Announce AFTER subscribing and before serving: the
+                        # node's reply to an announce may itself be a republished
+                        # backlog, which needs the subscription already in place
+                        # to arrive at all.
+                        if self.on_connected is not None:
+                            await self.on_connected()
                         self._connected.set()
                         await reader
                     finally:
@@ -166,64 +171,6 @@ class CasparBridgeClient:
             },
         )
 
-    async def call_creature(
-        self,
-        action: str,
-        payload: dict[str, Any],
-        timeout: float = _CREATURE_CALL_TIMEOUT,
-    ) -> dict:
-        """Call a creature action and wait for its ANSWER.
-
-        `signal` only tells you the node accepted the call: `/gateway/signal`
-        delivers and returns, and the caller is not a Caspar identity that
-        anything can signal back to. A creature that has something to say
-        publishes it on this project's topic under `creature/result`, tagged
-        with the correlation id generated here — which is what makes this a
-        request/response call rather than a send.
-
-        Without it, a caller reads the gateway's acknowledgement as though it
-        were the creature's reply: the model proxy did exactly that and
-        answered every completion with "the platform returned no completion".
-        """
-        correlation_id = uuid.uuid4().hex
-        future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._creature_calls[correlation_id] = future
-        try:
-            ack = await self.signal(
-                action, {**payload, "correlationId": correlation_id}, correlation_id
-            )
-            if isinstance(ack, dict) and ack.get("ok") is False:
-                raise RuntimeError(f"{action} was refused: {ack.get('error') or ack}")
-            return await asyncio.wait_for(future, timeout)
-        finally:
-            self._creature_calls.pop(correlation_id, None)
-
-    async def await_creature_result(self, correlation_id: str, timeout: float) -> Any:
-        """Wait for a result published under an id this client did not mint.
-
-        `call_creature` covers the ordinary case: ask, and wait for the answer
-        to that call. Some answers arrive under a DIFFERENT id, because they
-        come from somewhere else entirely — a question is answered by a person,
-        minutes later, and the creature says up front which id that answer will
-        carry. Waiting on it is the same machinery, entered from the other end.
-        """
-        if not correlation_id:
-            raise ValueError("a correlation id is required to wait for a result")
-        future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._creature_calls[correlation_id] = future
-        try:
-            return await asyncio.wait_for(future, timeout)
-        finally:
-            self._creature_calls.pop(correlation_id, None)
-
-    def resolve_creature_call(self, correlation_id: str, result: Any) -> bool:
-        """Hand a creature's answer to the call waiting for it."""
-        future = self._creature_calls.get(correlation_id)
-        if future is None or future.done():
-            return False
-        future.set_result(result if isinstance(result, dict) else {"result": result})
-        return True
-
     async def call(self, path: str, payload: dict[str, Any]) -> dict:
         socket = self._socket
         if socket is None:
@@ -294,7 +241,7 @@ class CasparBridgeClient:
         # Both tables: a creature's answer comes back over this connection too,
         # so a caller waiting on one must not wait out its whole timeout after
         # the socket has gone.
-        for table in (self._pending, self._creature_calls):
+        for table in (self._pending,):
             for future in list(table.values()):
                 if not future.done():
                     future.set_exception(RuntimeError(reason))

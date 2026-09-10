@@ -12,7 +12,7 @@ import asyncio
 
 import pytest
 
-from decillion_caspar_bridge.outbox import Outbox
+from decillion_tool_server.outbox import Outbox
 
 
 def _collector():
