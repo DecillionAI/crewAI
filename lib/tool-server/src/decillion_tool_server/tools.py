@@ -101,9 +101,26 @@ def _clip(text: str) -> str:
 
 
 def workspace_tools() -> list[Any]:
-    """Read, write and run things on the project's own machine."""
-    from crewai.tools import BaseTool
-    from pydantic import BaseModel, Field
+    """Read, write and run things on the project's own machine.
+
+    An import failure here is degraded, not fatal. These are built on
+    `crewai.tools.BaseTool`, and if that import fails — a broken install, a
+    partial upgrade — the machine can still say it is up and say it has nothing
+    to offer. It used to raise instead, out of `announce()`, which runs on every
+    connect: the connection died on its own success path, reconnected, and died
+    again. A project sat at "Starting the tool server" forever with no tools and
+    no error, which is the one outcome worse than having no catalogue.
+    """
+    try:
+        from crewai.tools import BaseTool
+        from pydantic import BaseModel, Field
+    except ImportError as exc:
+        logger.error(
+            "this machine can offer no tools: %s. The tool server is running, "
+            "but crewai is not importable in its environment.",
+            exc,
+        )
+        return []
 
     class ReadArgs(BaseModel):
         path: str = Field(description="Path of the file, relative to the project folder")

@@ -56,6 +56,12 @@ _HEAD_OF_LINE_ATTEMPTS = 12
 #: the run was actually billed.
 _CONFIRMED_KINDS = frozenset({"usage"})
 
+#: Where an event goes when nothing says otherwise — the meter, which is where
+#: every event this queue was built for went. Kept as the default so a record
+#: left on a project's volume by an older process still delivers where it was
+#: addressed when it was written.
+_DEFAULT_ACTION = "crew/message"
+
 
 def _now_ms() -> float:
     return time.time() * 1000
@@ -119,12 +125,18 @@ class Outbox:
 
     # ── producing ────────────────────────────────────────────────────────
 
-    def post(self, kind: str, payload: dict[str, Any]) -> str:
+    def post(self, kind: str, payload: dict[str, Any], *, action: str = _DEFAULT_ACTION) -> str:
         """Persist one event and queue it. Returns its stable event id.
 
         Synchronous on purpose: the write has to happen before the caller can
         believe the event exists, and the caller is often a CrewAI worker thread
         that has no loop of its own.
+
+        `action` is the creature this event is FOR, recorded with it. It used to
+        be implicit — everything this process produced was a run event for the
+        meter — and that stopped being true when the agents moved to the node:
+        what a sandbox produces now is a tool result for `crew/bridge`. A queue
+        that knew only one destination could not carry it.
         """
         self._seq += 1
         body = dict(payload)
@@ -140,6 +152,7 @@ class Outbox:
         record = {
             "name": name,
             "kind": kind,
+            "action": action,
             "eventId": event_id,
             "attempts": 0,
             "queuedAt": _now_ms(),
@@ -236,6 +249,9 @@ class Outbox:
         if not isinstance(payload, dict):
             return True
         kind = str(record.get("kind") or "")
+        # A record written by an OLDER process names no action: it can only have
+        # been a run event for the meter, which is where those went.
+        action = str(record.get("action") or _DEFAULT_ACTION)
         try:
             if kind in _CONFIRMED_KINDS and self._call is not None:
                 # The creature's OWN verdict, not the gateway's acknowledgement.
@@ -251,7 +267,7 @@ class Outbox:
                     )
                     return False
                 return True
-            await self._send("crew/message", payload)
+            await self._send(action, payload)
             return True
         except asyncio.CancelledError:
             raise

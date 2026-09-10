@@ -17,8 +17,10 @@ import logging
 import signal
 import sys
 
+from typing import Awaitable, Callable
+
 from .client import CasparBridgeClient
-from .config import load_config
+from .config import BridgeConfig, load_config
 from .outbox import Outbox
 from .server import ToolServer
 
@@ -28,6 +30,56 @@ logger = logging.getLogger("decillion_tool_server")
 #: window the node treats as "this server went away", because a heartbeat is
 #: much cheaper than the wake that missing one causes.
 _HEARTBEAT_SECS = 60.0
+
+#: The one thing this process says that must outlive it: a tool's RESULT. It is
+#: the answer to work a run is parked on, and the run is paying for the wait.
+#:
+#: Told apart by `fn`, not by the creature it goes to: an announcement travels
+#: to `crew/bridge` as well, and an announcement is only true while the socket
+#: it was sent on is up.
+_DURABLE = ("crew/bridge", "result")
+
+#: What the process uses to reach the node: one action and its payload, answered.
+Sender = Callable[[str, dict], Awaitable[dict]]
+
+
+def wire(config: BridgeConfig, send: Sender) -> tuple[Outbox, ToolServer]:
+    """Build the process's object graph.
+
+    Separated from `_run` so it can be built without a socket, a loop or a
+    sandbox — because the one thing no test covered was whether these three
+    objects fit together, and they did not. `__main__` called an `Outbox`
+    method that does not exist and passed the state directory where the project
+    id goes; the process died on its first line of real work, every time, and
+    the sandbox's restart loop hid it as "still starting". Forty passing tests
+    said nothing about it.
+
+    What a tool PRODUCED goes through the outbox: written to the project's own
+    volume first, delivered after, retried until the node accepts it. A tool
+    result dropped on a flaky socket is a run that waits out its frame lease for
+    no reason — and the sandbox that computed it may be gone by then. The outbox
+    finds its own directory (`DECILLION_STATE_DIR`, via `state_dir`), so it is
+    given the project it belongs to and nothing else.
+    """
+    outbox = Outbox(config.space_id, send)
+
+    async def report(action: str, payload: dict) -> dict:
+        """Send one thing the tool server has to say.
+
+        Two kinds, and they want opposite things. A tool RESULT is work already
+        done: it must survive this process, so it is queued durably and retried
+        until the node takes it. Liveness — announcing, heartbeats — is only
+        true at the instant it is sent, and an announcement is what the node
+        replays a project's backlog against, so it must travel on the live
+        connection rather than through a queue; replaying either later would
+        tell the node something false.
+        """
+        if (action, str(payload.get("fn") or "")) == _DURABLE:
+            return {"ok": True, "eventId": outbox.post("toolresult", payload, action=action)}
+        return await send(action, payload)
+
+    server = ToolServer(report, config.space_id, runtime_ref=config.runtime_ref)
+    return outbox, server
 
 
 async def _run() -> int:
@@ -49,12 +101,7 @@ async def _run() -> int:
         assert client is not None
         return await client.signal(action, payload)
 
-    # Everything this process reports goes through the outbox: written to the
-    # project's own volume first, delivered after, retried until the node
-    # accepts it. A tool result dropped on a flaky socket is a run that waits out
-    # its frame lease for no reason.
-    outbox = Outbox(config.state_dir, send)
-    server = ToolServer(outbox.send, config.space_id, runtime_ref=config.runtime_ref)
+    outbox, server = wire(config, send)
 
     async def on_update(key: str, payload: dict) -> None:
         """One packet pushed onto this project's topic."""
@@ -73,10 +120,14 @@ async def _run() -> int:
 
         Not just at startup: a subscription belongs to a connection and does not
         survive one closing, so a reconnect leaves the node believing this
-        machine is gone. Announcing again is also what replays the backlog.
+        machine is gone.
+
+        Nothing is done about the backlog here on purpose — the outbox's own
+        worker retries with backoff for as long as it takes, so a reconnect
+        needs no nudge, and blocking this path on a queue that empties only when
+        the node is healthy would be the wrong thing to wait for.
         """
         await server.announce()
-        await outbox.flush()
 
     client.on_connected = on_connected
 
@@ -102,6 +153,10 @@ async def _run() -> int:
     warmed = await asyncio.to_thread(server.warm)
     logger.info("catalogue ready: %d tools", warmed)
 
+    # Begin delivering, which also replays whatever a previous process left on
+    # the volume undelivered.
+    outbox.start()
+
     tasks = [asyncio.create_task(client.run()), asyncio.create_task(heartbeat())]
     await stopping.wait()
 
@@ -110,6 +165,7 @@ async def _run() -> int:
         task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await asyncio.gather(*tasks, return_exceptions=True)
+    await outbox.close()
     await client.close()
     return 0
 
