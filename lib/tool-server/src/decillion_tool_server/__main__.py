@@ -22,6 +22,7 @@ from typing import Awaitable, Callable
 from .client import CasparBridgeClient
 from .config import BridgeConfig, load_config
 from .outbox import Outbox
+from .state import stage
 from .server import ToolServer
 
 logger = logging.getLogger("decillion_tool_server")
@@ -92,6 +93,7 @@ async def _run() -> int:
         # Exiting non-zero rather than idling: the sandbox's restart loop will
         # try again, and the log says exactly what is missing.
         logger.error("tool server is not configured (%s)", config.describe())
+        stage(f"The tool server has no configuration ({config.describe()})")
         return 2
     logger.info("starting tool server: %s", config.describe())
 
@@ -128,6 +130,9 @@ async def _run() -> int:
         the node is healthy would be the wrong thing to wait for.
         """
         await server.announce()
+        # The bootstrap's last line is "Starting the tool server", so without
+        # this a machine that is up reads exactly like one that never started.
+        stage("This project's tools are connected and ready")
 
     client.on_connected = on_connected
 
@@ -159,6 +164,7 @@ async def _run() -> int:
         """
         warmed = await asyncio.to_thread(server.warm)
         logger.info("catalogue ready: %d tools", warmed)
+        stage(f"Tool catalogue ready ({warmed} tools)")
         # The node keeps the last catalogue it was told about, so announcing
         # again simply replaces the workspace-only list with the full one.
         with contextlib.suppress(Exception):

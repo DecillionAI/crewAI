@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -87,3 +88,31 @@ def read_json(path: Path) -> Any:
     except (OSError, ValueError):
         logger.warning("discarding unreadable state file %s", path.name)
         return None
+
+
+#: The machine's own setup narration — the file the bootstrap appends to and the
+#: platform reads back into the project's history (`syncSetupProgress`).
+_SETUP_LOG = "/data/.decillion/setup.log"
+
+
+def stage(text: str) -> None:
+    """Say where this machine has got to, where the PERSON is already looking.
+
+    The bootstrap writes these lines until it hands over, and its last one is
+    "Starting the tool server" — so a machine whose server came up perfectly
+    reads exactly like one that died on its first line, forever. Nothing else
+    the platform shows distinguishes them.
+
+    Best-effort by construction: a machine that cannot write its own narration
+    is still a working machine, and failing here would take out the thing the
+    line was reporting on.
+    """
+    line = str(text or "").strip()
+    if not line:
+        return
+    try:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(_SETUP_LOG, "a", encoding="utf-8") as handle:
+            handle.write(f"{stamp}\t{line}\n")
+    except OSError:
+        pass
