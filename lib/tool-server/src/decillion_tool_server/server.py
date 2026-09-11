@@ -32,6 +32,7 @@ import logging
 import time
 from typing import Any, Awaitable, Callable
 
+from .state import read_json, state_dir, write_json_atomically
 from .tools import build_catalog, run_tool, tool_manifest
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,12 @@ _MAX_CONCURRENT_TOOLS = 4
 #: left to the node's frame lease. The node's lease is the backstop; this is the
 #: message that actually says what happened.
 _TOOL_TIMEOUT_SECS = 600.0
+
+# Completed calls are retained long enough to cover reconnects, catalogue
+# refreshes and sandbox restarts.  The cache is bounded because this file lives
+# on the project's persistent volume.
+_RESULT_RETENTION_MS = 24 * 60 * 60 * 1000
+_MAX_COMPLETED_RESULTS = 4096
 
 
 class ToolServer:
@@ -61,16 +68,24 @@ class ToolServer:
         send: Callable[[str, dict], Awaitable[dict]],
         space_id: str,
         runtime_ref: str = "",
+        *,
+        reported_call_ids: set[str] | None = None,
     ) -> None:
         self._send = send
         self._space_id = space_id
         self._runtime_ref = runtime_ref
         self._semaphore = asyncio.Semaphore(_MAX_CONCURRENT_TOOLS)
         self._running: dict[str, asyncio.Task] = {}
+        self._results_path = state_dir() / "tool-results.json"
+        self._completed = self._load_completed()
+        # These calls already have a result in the durable outbox.  Keeping the
+        # distinction from `_completed` matters after a crash: a completed call
+        # with no queued answer must be reported again, but never re-executed.
+        self._reported = set(reported_call_ids or ())
 
     # ── Announcing ───────────────────────────────────────────────────────
 
-    async def announce(self) -> None:
+    async def announce(self, *, replay: bool = True) -> None:
         """Tell the node this machine is ready, and what it can run.
 
         This is what replays a project's backlog. A tool call made while the
@@ -93,6 +108,10 @@ class ToolServer:
                 "spaceId": self._space_id,
                 "tools": manifest,
                 "ref": self._runtime_ref,
+                # A connection announcement must replay requests that may have
+                # been published while the socket was away.  A catalogue-only
+                # refresh must not replay calls that are already in flight.
+                "replay": replay,
             },
         )
 
@@ -108,6 +127,15 @@ class ToolServer:
         call_id = str(request.get("callId") or "")
         if not call_id:
             logger.warning("ignoring a tool request with no callId")
+            return
+        cached = self._completed.get(call_id)
+        if isinstance(cached, dict):
+            if call_id in self._reported:
+                logger.info("tool call %s was already completed and reported", call_id)
+                return
+            logger.info("re-reporting cached result for tool call %s", call_id)
+            self._reported.add(call_id)
+            await self._report(dict(cached.get("outcome") or {}))
             return
         if call_id in self._running:
             # At-least-once delivery: the node republishes anything it has not
@@ -152,7 +180,42 @@ class ToolServer:
 
         outcome["callId"] = call_id
         outcome["durationMs"] = int((time.monotonic() - started) * 1000)
+        # Record completion before handing the answer to the asynchronous
+        # outbox.  From this point onward every replay can return this exact
+        # result, and a side-effecting tool is never invoked twice.
+        self._remember(call_id, outcome)
+        self._reported.add(call_id)
         await self._report(outcome)
+
+    def _load_completed(self) -> dict[str, dict[str, Any]]:
+        value = read_json(self._results_path)
+        if not isinstance(value, dict):
+            return {}
+        now = int(time.time() * 1000)
+        kept: dict[str, dict[str, Any]] = {}
+        for call_id, entry in value.items():
+            if not isinstance(entry, dict) or not isinstance(entry.get("outcome"), dict):
+                continue
+            try:
+                completed_at = int(entry.get("completedAt") or 0)
+            except (TypeError, ValueError):
+                continue
+            if completed_at > 0 and now - completed_at <= _RESULT_RETENTION_MS:
+                kept[str(call_id)] = entry
+        return dict(sorted(kept.items(), key=lambda item: int(item[1].get("completedAt") or 0))[-_MAX_COMPLETED_RESULTS:])
+
+    def _remember(self, call_id: str, outcome: dict[str, Any]) -> None:
+        self._completed[call_id] = {
+            "completedAt": int(time.time() * 1000),
+            "outcome": dict(outcome),
+        }
+        if len(self._completed) > _MAX_COMPLETED_RESULTS:
+            oldest = min(
+                self._completed,
+                key=lambda key: int(self._completed[key].get("completedAt") or 0),
+            )
+            self._completed.pop(oldest, None)
+        write_json_atomically(self._results_path, self._completed)
 
     async def _report(self, outcome: dict[str, Any]) -> None:
         """Send one result back, letting the outbox retry it.
@@ -175,7 +238,7 @@ class ToolServer:
         away without saying so" and wakes the machine on the next tool call. A
         heartbeat is much cheaper than a wake.
         """
-        await self._send("crew/status", {"fn": "toolServer", "spaceId": self._space_id, "at": int(time.time() * 1000)})
+        await self._send("crew/bridge", {"fn": "heartbeat", "spaceId": self._space_id, "at": int(time.time() * 1000)})
 
     def warm(self) -> int:
         """Build the catalogue now, off the hot path.

@@ -103,24 +103,27 @@ def _clip(text: str) -> str:
 def workspace_tools() -> list[Any]:
     """Read, write and run things on the project's own machine.
 
-    An import failure here is degraded, not fatal. These are built on
-    `crewai.tools.BaseTool`, and if that import fails — a broken install, a
-    partial upgrade — the machine can still say it is up and say it has nothing
-    to offer. It used to raise instead, out of `announce()`, which runs on every
-    connect: the connection died on its own success path, reconnected, and died
-    again. A project sat at "Starting the tool server" forever with no tools and
-    no error, which is the one outcome worse than having no catalogue.
+    These deliberately do not inherit CrewAI's BaseTool. Agents no longer run
+    in this process, and importing the entire framework just to obtain a tiny
+    ``run -> _run`` adapter put its dependency graph on every cold boot's
+    critical path. The bridge contract is structural: name, description,
+    schema and ``run(**args)``.
     """
     try:
-        from crewai.tools import BaseTool
         from pydantic import BaseModel, Field
     except ImportError as exc:
         logger.error(
-            "this machine can offer no tools: %s. The tool server is running, "
-            "but crewai is not importable in its environment.",
+            "this machine can offer no workspace tools: %s",
             exc,
         )
         return []
+
+    class WorkspaceTool:
+        args_schema: type[BaseModel]
+
+        def run(self, **kwargs: Any) -> Any:
+            values = self.args_schema.model_validate(kwargs).model_dump()
+            return self._run(**values)
 
     class ReadArgs(BaseModel):
         path: str = Field(description="Path of the file, relative to the project folder")
@@ -139,9 +142,9 @@ def workspace_tools() -> list[Any]:
     class ShellArgs(BaseModel):
         command: str = Field(description="The shell command to run in the project folder")
 
-    class ReadFile(BaseTool):
-        name: str = "read_project_file"
-        description: str = (
+    class ReadFile(WorkspaceTool):
+        name = "read_project_file"
+        description = (
             "Read a file from the project's folder. Use this before editing a file, "
             "so you change what is actually there."
         )
@@ -159,9 +162,9 @@ def workspace_tools() -> list[Any]:
             except OSError as exc:
                 return f"Error: could not read {path}: {exc}"
 
-    class WriteFile(BaseTool):
-        name: str = "write_project_file"
-        description: str = (
+    class WriteFile(WorkspaceTool):
+        name = "write_project_file"
+        description = (
             "Write a file into the project's folder, creating it and any missing "
             "folders. This is how you deliver work: a file written here is what "
             "the team sees in the project's Files panel. Overwrites the file."
@@ -180,9 +183,9 @@ def workspace_tools() -> list[Any]:
                 return f"Error: could not write {path}: {exc}"
             return f"Wrote {len(str(content))} characters to {path}"
 
-    class AppendFile(BaseTool):
-        name: str = "append_project_file"
-        description: str = (
+    class AppendFile(WorkspaceTool):
+        name = "append_project_file"
+        description = (
             "Add text to the end of a file in the project's folder, creating it if "
             "it does not exist. Use this for a log or a running document rather "
             "than rewriting the whole file."
@@ -202,9 +205,9 @@ def workspace_tools() -> list[Any]:
                 return f"Error: could not append to {path}: {exc}"
             return f"Added {len(str(content))} characters to {path}"
 
-    class ListFiles(BaseTool):
-        name: str = "list_project_files"
-        description: str = (
+    class ListFiles(WorkspaceTool):
+        name = "list_project_files"
+        description = (
             "List what is in a folder of the project. Use this first to find out "
             "what the project already contains, so you build on it rather than "
             "duplicating a teammate's work."
@@ -224,9 +227,9 @@ def workspace_tools() -> list[Any]:
             )
             return _clip("\n".join(rows)) if rows else "(the folder is empty)"
 
-    class RunShell(BaseTool):
-        name: str = "run_shell_command"
-        description: str = (
+    class RunShell(WorkspaceTool):
+        name = "run_shell_command"
+        description = (
             "Run a shell command on the project's machine, in the project's folder. "
             "Use it to run code, tests, or any command-line tool. Returns the "
             "command's output; a command that takes longer than five minutes is "
@@ -258,15 +261,6 @@ def workspace_tools() -> list[Any]:
             return _clip("\n".join(parts)) if parts else "(the command produced no output)"
 
     return [ReadFile(), WriteFile(), AppendFile(), ListFiles(), RunShell()]
-
-
-# ── the project's Caspar tools ───────────────────────────────────────────────
-
-
-try:  # pragma: no cover - exercised only where crewai is installed
-    from crewai.tools import BaseTool as _BaseTool
-except Exception:  # noqa: BLE001 - the pure helpers above must import without crewai
-    _BaseTool = object  # type: ignore[assignment,misc]
 
 
 # ── asking the people on the project ─────────────────────────────────────────
@@ -631,7 +625,7 @@ def run_tool(name: str, args: dict[str, Any]) -> str:
         return f"Error: this project's machine has no tool called {name!r}. It has: {available}"
     try:
         result = tool.run(**(args or {}))
-    except TypeError as exc:
+    except (TypeError, ValueError) as exc:
         # Wrong arguments: the model can fix this on the next turn if it is told
         # what the tool wanted.
         schema = getattr(tool, "args_schema", None)

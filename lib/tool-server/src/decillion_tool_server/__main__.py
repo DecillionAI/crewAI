@@ -79,7 +79,12 @@ def wire(config: BridgeConfig, send: Sender) -> tuple[Outbox, ToolServer]:
             return {"ok": True, "eventId": outbox.post("toolresult", payload, action=action)}
         return await send(action, payload)
 
-    server = ToolServer(report, config.space_id, runtime_ref=config.runtime_ref)
+    server = ToolServer(
+        report,
+        config.space_id,
+        runtime_ref=config.runtime_ref,
+        reported_call_ids=outbox.pending_tool_call_ids,
+    )
     return outbox, server
 
 
@@ -168,7 +173,7 @@ async def _run() -> int:
         # The node keeps the last catalogue it was told about, so announcing
         # again simply replaces the workspace-only list with the full one.
         with contextlib.suppress(Exception):
-            await server.announce()
+            await server.announce(replay=False)
 
     # Begin delivering, which also replays whatever a previous process left on
     # the volume undelivered.

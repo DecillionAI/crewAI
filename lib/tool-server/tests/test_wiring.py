@@ -77,7 +77,7 @@ def test_liveness_goes_straight_out_and_is_never_replayed():
     # A heartbeat replayed from ten minutes ago would tell the node something
     # false, so it is not queued — it is sent, and allowed to fail.
     assert outbox.pending == 0
-    assert [action for action, _ in sent] == ["crew/status"]
+    assert [action for action, _ in sent] == ["crew/bridge"]
 
 
 def test_an_announcement_travels_on_the_live_connection():

@@ -182,6 +182,28 @@ class Outbox:
     def pending(self) -> int:
         return len(list(self._dir.glob("*.json")))
 
+    @property
+    def pending_tool_call_ids(self) -> set[str]:
+        """Tool results already durably queued for delivery.
+
+        A catalogue refresh can make the node replay a call after the tool has
+        finished but before its queued result reaches the creature.  The tool
+        server uses this set when it starts so that replay does not execute the
+        side effect again while the outbox is already carrying its answer.
+        """
+        call_ids: set[str] = set()
+        for path in self._dir.glob("*.json"):
+            record = read_json(path)
+            if not isinstance(record, dict) or record.get("action") != "crew/bridge":
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict) or payload.get("fn") != "result":
+                continue
+            call_id = str(payload.get("callId") or "")
+            if call_id:
+                call_ids.add(call_id)
+        return call_ids
+
     # ── delivering ───────────────────────────────────────────────────────
 
     async def _drain(self) -> None:

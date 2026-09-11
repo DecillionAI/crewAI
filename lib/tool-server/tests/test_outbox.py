@@ -184,3 +184,16 @@ def test_every_event_carries_an_id_the_creature_can_dedupe_on():
     first = outbox.post("step", {"runId": "r1"})
     second = outbox.post("step", {"runId": "r1"})
     assert first and second and first != second
+
+
+def test_pending_tool_results_expose_the_calls_they_already_cover():
+    _, send = _collector()
+    outbox = Outbox("space-1", send)
+    outbox.post(
+        "toolresult",
+        {"fn": "result", "callId": "c1", "ok": True, "result": "done"},
+        action="crew/bridge",
+    )
+    outbox.post("step", {"runId": "r1"})
+
+    assert outbox.pending_tool_call_ids == {"c1"}

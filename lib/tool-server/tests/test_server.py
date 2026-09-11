@@ -234,3 +234,79 @@ async def test_a_redelivered_request_does_not_run_the_tool_twice(catalogue):
         await asyncio.sleep(0.01)
 
     assert len(tool.calls) == 1, "a duplicate delivery must not run the tool again"
+
+
+@pytest.mark.asyncio
+async def test_a_replay_after_completion_does_not_run_or_report_twice(catalogue):
+    tool = _FakeTool("Write", result="written")
+    catalogue(workspace=[tool])
+    send = _Recorder()
+    server = ToolServer(send, "s1")
+    request = {"callId": "completed-call", "tool": "Write", "args": {"text": "once"}}
+
+    await server.on_request(request)
+    for _ in range(20):
+        if send.sent:
+            break
+        await asyncio.sleep(0.01)
+    await server.on_request(request)
+    await asyncio.sleep(0.02)
+
+    assert tool.calls == [{"text": "once"}]
+    assert len(send.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_completed_call_survives_a_process_restart(catalogue):
+    tool = _FakeTool("Write", result="written")
+    catalogue(workspace=[tool])
+    first_send = _Recorder()
+    first = ToolServer(first_send, "s1")
+    request = {"callId": "restart-call", "tool": "Write", "args": {}}
+
+    await first.on_request(request)
+    for _ in range(20):
+        if first_send.sent:
+            break
+        await asyncio.sleep(0.01)
+
+    second_send = _Recorder()
+    second = ToolServer(second_send, "s1")
+    await second.on_request(request)
+
+    assert len(tool.calls) == 1
+    assert len(second_send.sent) == 1
+    assert second_send.sent[0][1]["result"] == "written"
+
+
+@pytest.mark.asyncio
+async def test_a_queued_result_is_not_requeued_after_restart(catalogue):
+    tool = _FakeTool("Write", result="written")
+    catalogue(workspace=[tool])
+    first_send = _Recorder()
+    first = ToolServer(first_send, "s1")
+    request = {"callId": "queued-call", "tool": "Write", "args": {}}
+    await first.on_request(request)
+    for _ in range(20):
+        if first_send.sent:
+            break
+        await asyncio.sleep(0.01)
+
+    second_send = _Recorder()
+    second = ToolServer(second_send, "s1", reported_call_ids={"queued-call"})
+    await second.on_request(request)
+
+    assert len(tool.calls) == 1
+    assert second_send.sent == []
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_updates_the_bridge_liveness_route(catalogue):
+    catalogue()
+    send = _Recorder()
+    server = ToolServer(send, "s1")
+
+    await server.heartbeat()
+
+    assert send.sent[0][0] == "crew/bridge"
+    assert send.sent[0][1]["fn"] == "heartbeat"
