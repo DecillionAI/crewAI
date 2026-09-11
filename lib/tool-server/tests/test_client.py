@@ -16,12 +16,12 @@ def _client():
         token="t" * 40,
         crew_home="/opt/crewai",
         log_level="INFO",
-        llm_proxy_port=8788,
+        state_dir="/tmp/decillion-tool-server-test",
+        runtime_ref="abc123",
     )
 
     async def on_update(key, data):
         return None
 
     return CasparBridgeClient(cfg, on_update)
-
 

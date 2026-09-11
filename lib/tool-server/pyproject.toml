@@ -1,7 +1,7 @@
 [project]
 name = "decillion-tool-server"
 dynamic = ["version"]
-description = "Runs a Decillion project's agents as a CrewAI crew inside its Modal sandbox, connected to the Caspar node over the gateway subscription channel."
+description = "Exposes a Decillion project's sandbox tools to its Caspar-hosted agents over the gateway subscription channel."
 readme = "README.md"
 requires-python = ">=3.10, <3.14"
 dependencies = [
