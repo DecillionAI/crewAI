@@ -93,3 +93,31 @@ def test_an_announcement_travels_on_the_live_connection():
     # moment.
     assert outbox.pending == 0
     assert [(action, payload.get("fn")) for action, payload in sent] == [("crew/bridge", "announce")]
+
+
+def test_announcing_never_waits_for_the_catalogue():
+    """The machine reports itself the moment it can, not when it is finished.
+
+    Building the catalogue says yes to package installs, so it is minutes of
+    network on a cold machine. While that ran ahead of the first connect, the
+    process had not announced and the project sat at "Starting the tool server"
+    with a sandbox that was running perfectly — the one failure mode a tool
+    server must not have.
+    """
+    import decillion_tool_server.tools as tools_mod
+
+    built: list[str] = []
+
+    def never_call_me(*, build: bool = True):
+        if build:
+            built.append("built")
+        return []
+
+    original = tools_mod.catalog_tools
+    tools_mod.catalog_tools = never_call_me
+    try:
+        tools_mod.tool_manifest()
+    finally:
+        tools_mod.catalog_tools = original
+
+    assert built == [], "an announce must ask only for what is already built"

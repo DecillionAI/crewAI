@@ -147,17 +147,32 @@ async def _run() -> int:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, _stop)
 
-    # Build the catalogue BEFORE announcing. Saying yes to the tool installers
-    # means the first build can take minutes, and announcing an empty catalogue
-    # would offer an agent nothing and then quietly grow the list under it.
-    warmed = await asyncio.to_thread(server.warm)
-    logger.info("catalogue ready: %d tools", warmed)
+    async def warm_catalogue() -> None:
+        """Build the catalogue, then tell the node it grew.
+
+        OFF the startup path, and that is the whole point. Building says YES to
+        the package installs several catalogue constructors ask for, so a cold
+        machine spends minutes here — and while it did, this process had not
+        connected, had not announced, and the project sat at "Starting the tool
+        server" with a sandbox that was in fact running perfectly. Liveness must
+        never queue behind an unbounded, network-dependent build.
+        """
+        warmed = await asyncio.to_thread(server.warm)
+        logger.info("catalogue ready: %d tools", warmed)
+        # The node keeps the last catalogue it was told about, so announcing
+        # again simply replaces the workspace-only list with the full one.
+        with contextlib.suppress(Exception):
+            await server.announce()
 
     # Begin delivering, which also replays whatever a previous process left on
     # the volume undelivered.
     outbox.start()
 
-    tasks = [asyncio.create_task(client.run()), asyncio.create_task(heartbeat())]
+    tasks = [
+        asyncio.create_task(client.run()),
+        asyncio.create_task(heartbeat()),
+        asyncio.create_task(warm_catalogue()),
+    ]
     await stopping.wait()
 
     logger.info("shutting down")

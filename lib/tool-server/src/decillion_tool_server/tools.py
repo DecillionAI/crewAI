@@ -304,8 +304,14 @@ _CATALOG_CACHE: list[Any] | None = None
 _CATALOG_LOCK = threading.Lock()
 
 
-def catalog_tools() -> list[Any]:
+def catalog_tools(*, build: bool = True) -> list[Any]:
     """Every `crewai_tools` tool that can actually be built in this sandbox.
+
+    `build=False` answers with what is already built and never starts a build.
+    Building is not a cheap read: it constructs the whole catalogue and says YES
+    to the package installs some constructors ask for, which is minutes of
+    network on a cold machine. Anything on a latency path — above all announcing
+    this machine to the node — must take that door.
 
     The catalogue is large and most of it needs a vendor account, so each tool
     is *constructed* and kept only if that worked. A tool needing an API key
@@ -319,6 +325,8 @@ def catalog_tools() -> list[Any]:
         return []
     if _CATALOG_CACHE is not None:
         return list(_CATALOG_CACHE)
+    if not build:
+        return []
     with _CATALOG_LOCK:
         if _CATALOG_CACHE is not None:
             # Built while this call waited for the lock.
@@ -551,7 +559,7 @@ def _missing_env(instance: Any) -> list[str]:
 # reports back on announce.
 
 
-def _all_tools() -> dict[str, Any]:
+def _all_tools(*, build: bool = True) -> dict[str, Any]:
     """Every tool this machine can actually run, by name.
 
     The project's OWN tools come first and win a name collision. A catalogue
@@ -559,7 +567,7 @@ def _all_tools() -> dict[str, Any]:
     reads this project's files — the agent asked about this project.
     """
     out: dict[str, Any] = {}
-    for tool in catalog_tools():
+    for tool in catalog_tools(build=build):
         name = getattr(tool, "name", "")
         if name:
             out[name] = tool
@@ -577,7 +585,11 @@ def tool_manifest() -> list[dict[str, Any]]:
     asking first — a round trip on the critical path of every first prompt.
     """
     manifest: list[dict[str, Any]] = []
-    for name, tool in _all_tools().items():
+    # Never a build: this is what an ANNOUNCE carries, and an announcement that
+    # waited for the catalogue was an announcement that never happened. The
+    # workspace tools need no install and are always here; the catalogue joins
+    # them when it is warm, and the node is told again then.
+    for name, tool in _all_tools(build=False).items():
         entry: dict[str, Any] = {
             "name": name,
             "description": str(getattr(tool, "description", "") or ""),

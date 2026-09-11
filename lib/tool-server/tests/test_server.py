@@ -43,7 +43,9 @@ def catalogue(monkeypatch):
         installed["workspace"] = list(workspace)
         installed["catalog"] = list(catalog)
         monkeypatch.setattr(tools_mod, "workspace_tools", lambda: installed["workspace"])
-        monkeypatch.setattr(tools_mod, "catalog_tools", lambda: installed["catalog"])
+        # Takes `build` because the real one does: an announce asks for what is
+        # already built and must never start a build (see tools.catalog_tools).
+        monkeypatch.setattr(tools_mod, "catalog_tools", lambda *, build=True: installed["catalog"])
         return installed
 
     return _set
