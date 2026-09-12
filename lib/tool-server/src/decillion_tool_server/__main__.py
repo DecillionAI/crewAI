@@ -184,15 +184,15 @@ async def _run() -> int:
         asyncio.create_task(heartbeat()),
         asyncio.create_task(warm_catalogue()),
     ]
-    #await stopping.wait()
+    await stopping.wait()
 
-    #logger.info("shutting down")
-    #for task in tasks:
-    #    task.cancel()
-    #with contextlib.suppress(asyncio.CancelledError):
-    #    await asyncio.gather(*tasks, return_exceptions=True)
-    #await outbox.close()
-    #await client.close()
+    logger.info("shutting down")
+    for task in tasks:
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.gather(*tasks, return_exceptions=True)
+    await outbox.close()
+    await client.close()
     return 0
 
 
