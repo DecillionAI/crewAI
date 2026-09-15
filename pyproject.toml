@@ -302,6 +302,7 @@ members = [
     "lib/crewai-files",
     "lib/cli",
     "lib/crewai-core",
+    "lib/tool-server",
 ]
 
 
@@ -312,3 +313,4 @@ crewai-devtools = { workspace = true }
 crewai-files = { workspace = true }
 crewai-cli = { workspace = true }
 crewai-core = { workspace = true }
+decillion-tool-server = { workspace = true }

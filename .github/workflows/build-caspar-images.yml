@@ -1,0 +1,100 @@
+name: Build Caspar deployment images
+
+# The two halves of a CrewAI deployment on Caspar, published to GHCR:
+#
+#   crewai-engine   the agentic engine — deployed to the node as a docker creature
+#   crewai-sandbox  the tool catalogue + tool server — booted by each project's machine
+#
+# Autobot's deploy script consumes both by tag: the engine as the base image of
+# its `creatures/crewai` Dockerfile, the sandbox as the image a space's Modal
+# machine starts. Pushing here is therefore the release — nothing downstream
+# needs a version bumping by hand.
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths:
+      - "lib/crewai/**"
+      - "lib/crewai-core/**"
+      - "lib/cli/**"
+      - "lib/crewai-tools/**"
+      - "lib/tool-server/**"
+      - "docker/**"
+      - ".github/workflows/build-caspar-images.yml"
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push the images to GHCR (off = build only)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: caspar-images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      # Keep going: a sandbox-image failure should not hide a working engine
+      # image, and vice versa — they are deployed independently.
+      fail-fast: false
+      matrix:
+        include:
+          - name: crewai-engine
+            dockerfile: docker/engine.Dockerfile
+          - name: crewai-sandbox
+            dockerfile: docker/sandbox.Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'workflow_dispatch' || inputs.push
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
+          # A branch tag so a deployment can follow a branch, and an immutable
+          # sha tag so one can be frozen. `crewRef` accepts a full commit sha
+          # precisely so a deployment's machines change only when it says so.
+          tags: |
+            type=ref,event=branch
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            RUNTIME_REF=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+          provenance: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${{ matrix.name }}"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
