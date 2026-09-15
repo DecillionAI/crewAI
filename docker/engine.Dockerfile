@@ -63,10 +63,21 @@ RUN apt-get update \
 
 COPY --from=build /opt/crewai /opt/crewai
 
-# An agent that writes `python` gets `python`. Debian ships only `python3`, and
-# a tool call reaching for the obvious name comes back "not found" on a machine
-# that had Python all along.
-RUN ln -sf /opt/crewai/bin/python /usr/local/bin/python
+# There is deliberately NO symlink from /usr/local/bin/python into this venv.
+#
+# `python -m venv` records the interpreter AS INVOKED, so building the venv with
+# `python` makes /opt/crewai/bin/python a link to /usr/local/bin/python. Pointing
+# /usr/local/bin/python back at the venv therefore closes a two-link cycle, and
+# every `python` in the image — including the venv's own — then fails with
+# "Too many levels of symbolic links". The venv works precisely BECAUSE that
+# base link still resolves to the real interpreter.
+#
+# Nothing is lost by leaving it alone: this base image already ships
+# /usr/local/bin/python, and PATH above puts the venv's first, so `python` in
+# any process that inherits the image's environment is already this venv's.
+# A LOGIN shell rebuilds PATH from /etc/profile and would miss it, which is what
+# this covers instead.
+RUN printf 'PATH="/opt/crewai/bin:$PATH"\n' > /etc/profile.d/10-crewai-venv.sh
 
 WORKDIR /app
 RUN python -c "import crewai; print('crewai', crewai.__version__)"

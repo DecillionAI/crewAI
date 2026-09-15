@@ -60,7 +60,28 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/decillion/venv /opt/decillion/venv
-RUN ln -sf /opt/decillion/venv/bin/python /usr/local/bin/python
+
+# No symlink from /usr/local/bin/python into the venv — see the same note in
+# engine.Dockerfile. It closes a cycle through the venv's own link back to the
+# base interpreter and every `python` in the image raises ELOOP. This image had
+# no import check to catch it, so it built green and the tool server died on its
+# first exec inside somebody's sandbox, which is the worst place to find it.
+#
+# PATH above already makes the venv's python the one any inherited environment
+# gets; this covers a login shell, which rebuilds PATH from /etc/profile.
+RUN printf 'PATH="/opt/decillion/venv/bin:$PATH"\n' > /etc/profile.d/10-crewai-venv.sh
+
+# What must work here is not `python` on PATH but the ENTRYPOINT's own shebang:
+# `decillion-tool-server` is a console script whose first line names an absolute
+# interpreter, and that is the resolution the kernel performs at exec. Checking
+# it the way the kernel does is what turns a runtime failure on a project's
+# machine into a failed build here.
+RUN set -eux; \
+    python -c "import crewai, crewai_tools, decillion_tool_server"; \
+    script="$(command -v decillion-tool-server)"; \
+    interp="$(sed -n '1s/^#!//p' "$script")"; \
+    test -n "$interp"; \
+    "$interp" -c "import decillion_tool_server"
 
 # The revision baked into this image. The sandbox's bootstrap compares the
 # commit a fetch RESOLVED TO against this, never the ref's name — a marker
