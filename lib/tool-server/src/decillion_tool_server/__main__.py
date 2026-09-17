@@ -27,10 +27,12 @@ from .server import ToolServer
 
 logger = logging.getLogger("decillion_tool_server")
 
-#: How often to tell the node this machine is still here. Comfortably inside the
-#: window the node treats as "this server went away", because a heartbeat is
-#: much cheaper than the wake that missing one causes.
-_HEARTBEAT_SECS = 60.0
+#: How often to tell the node this machine is still here.
+#:
+#: Must be LONGER than the sandbox idle timeout (five minutes). A ping every
+#: minute is network activity Modal treats as use, so a quiet project never
+#: slept. Missing one is cheaper than a machine that cannot idle.
+_HEARTBEAT_SECS = float(__import__("os").environ.get("DECILLION_HEARTBEAT_SECS") or "360")
 
 #: The one thing this process says that must outlive it: a tool's RESULT. It is
 #: the answer to work a run is parked on, and the run is paying for the wait.
