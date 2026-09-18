@@ -49,14 +49,17 @@ ENV PATH="/opt/decillion/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     XDG_DATA_HOME=/data/.crewai/data \
-    XDG_CACHE_HOME=/data/.crewai/cache
+    XDG_CACHE_HOME=/tmp/crewai-cache \
+    UV_CACHE_DIR=/tmp/uv-cache
 
 # What a tool actually needs from the machine: a shell, a VCS, a fetcher, and
 # the ability to unpack what it downloads. A tool that shells out to something
-# missing fails in a way that reads as the tool being broken.
+# missing fails in a way that reads as the tool being broken. The graphical
+# desktop is baked in so starting Computer is seconds, not an apt-get.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates git curl wget unzip zip tar procps jq ripgrep less \
+      xvfb x11vnc xfce4 xfce4-terminal dbus-x11 novnc websockify \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/decillion/venv /opt/decillion/venv
