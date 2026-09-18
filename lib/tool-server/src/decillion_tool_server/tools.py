@@ -243,9 +243,11 @@ def workspace_tools() -> list[Any]:
                     str(command),
                     shell=True,
                     cwd=WORKSPACE_ROOT,
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
                     timeout=SHELL_TIMEOUT_SECONDS,
+                    start_new_session=True,
                 )
             except subprocess.TimeoutExpired:
                 return f"Error: the command did not finish within {SHELL_TIMEOUT_SECONDS} seconds"
