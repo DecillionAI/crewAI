@@ -43,6 +43,16 @@ def test_output_is_clipped_with_the_size_it_dropped():
     assert tools._clip("short") == "short"
 
 
+def test_a_live_desktop_exports_display_into_the_shell(tmp_path, monkeypatch):
+    monkeypatch.setenv("DECILLION_WORKSPACE", str(tmp_path))
+    autobot = tmp_path / ".autobot"
+    autobot.mkdir()
+    (autobot / "desktop.env").write_text("DISPLAY=:1\nHOME=/data/.autobot/desktop-home\n", encoding="utf-8")
+    env = tools._shell_env()
+    assert env["DISPLAY"] == ":1"
+    assert env["HOME"] == "/data/.autobot/desktop-home"
+
+
 def test_the_catalogue_can_be_turned_off(monkeypatch):
     monkeypatch.setattr(tools, "_CATALOG_ENABLED", False)
     monkeypatch.setattr(tools, "_CATALOG_CACHE", None)

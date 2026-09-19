@@ -53,6 +53,28 @@ logger = logging.getLogger(__name__)
 #: Anything written elsewhere in the container is lost when the machine stops.
 WORKSPACE_ROOT = os.environ.get("DECILLION_WORKSPACE", "/data")
 
+
+def _shell_env() -> dict[str, str]:
+    """GUI apps an agent starts land on Computer when that session is up."""
+    env = os.environ.copy()
+    root = Path(os.environ.get("DECILLION_WORKSPACE", WORKSPACE_ROOT))
+    env_file = root / ".autobot" / "desktop.env"
+    ready = root / ".autobot" / "desktop-ready"
+    if env_file.is_file():
+        try:
+            for raw in env_file.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                env[key.strip()] = value.strip().strip('"').strip("'")
+        except OSError:
+            logger.debug("could not read desktop.env")
+    elif ready.is_file():
+        env.setdefault("DISPLAY", ":1")
+    return env
+
+
 #: How long one shell command may run before it is killed. Long enough for an
 #: install or a test run, short enough that a hung command does not hold the
 #: turn open until the model's own timeout.
@@ -230,10 +252,12 @@ def workspace_tools() -> list[Any]:
     class RunShell(WorkspaceTool):
         name = "run_shell_command"
         description = (
-            "Run a shell command on the project's machine, in the project's folder. "
-            "Use it to run code, tests, or any command-line tool. Returns the "
-            "command's output; a command that takes longer than five minutes is "
-            "stopped."
+            "Run a shell command on the project's machine, in the project's folder (/data). "
+            "That folder is the same tree Files and the Computer file manager show. "
+            "When Computer is on, DISPLAY is already set so a browser or file manager "
+            "appears on that desktop. For a site that needs a human login, ask the person "
+            "to open Computer and complete it. Returns the command's output; a command "
+            "that takes longer than five minutes is stopped."
         )
         args_schema: type[BaseModel] = ShellArgs
 
@@ -243,6 +267,7 @@ def workspace_tools() -> list[Any]:
                     str(command),
                     shell=True,
                     cwd=WORKSPACE_ROOT,
+                    env=_shell_env(),
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
