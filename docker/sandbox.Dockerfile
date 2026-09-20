@@ -55,16 +55,16 @@ ENV PATH="/opt/decillion/venv/bin:$PATH" \
 # What a tool actually needs from the machine: a shell, a VCS, a fetcher, and
 # the ability to unpack what it downloads. A tool that shells out to something
 # missing fails in a way that reads as the tool being broken. The graphical
-# desktop is baked in so starting Computer is seconds, not an apt-get — which
-# means every package the start script looks for (autobot's `desktopStartScript`:
-# openbox, pcmanfm, xterm, xsetroot/xdpyinfo, firefox-esr), not a desktop it
-# never launches. This carried xfce4 instead, so Computer apt-got a window
-# manager and a browser on every cold machine and died silently when that failed.
+# desktop is baked in so starting Computer is seconds, not an apt-get. A sandbox
+# installs to its own filesystem, so anything missing here is re-fetched on every
+# cold machine: `xsetroot`/`xdpyinfo` and a browser were, and Computer spent
+# minutes on them before showing anything. The session picks what it finds
+# (autobot's `desktopStartScript`), so this list is what it should find.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates git curl wget unzip zip tar procps jq ripgrep less \
-      xvfb x11vnc x11-xserver-utils dbus-x11 novnc websockify \
-      openbox pcmanfm xterm firefox-esr \
+      xvfb x11vnc x11-xserver-utils xfce4 xfce4-terminal dbus-x11 \
+      novnc websockify firefox-esr \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/decillion/venv /opt/decillion/venv
