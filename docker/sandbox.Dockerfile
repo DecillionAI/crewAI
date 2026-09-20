@@ -63,7 +63,7 @@ ENV PATH="/opt/decillion/venv/bin:$PATH" \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates git curl wget unzip zip tar procps jq ripgrep less \
-      xvfb x11vnc x11-xserver-utils xfce4 xfce4-terminal dbus-x11 \
+      xvfb x11vnc x11-xserver-utils xfce4 xfce4-terminal thunar dbus-x11 \
       novnc websockify firefox-esr \
  && rm -rf /var/lib/apt/lists/*
 

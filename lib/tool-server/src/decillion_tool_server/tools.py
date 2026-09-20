@@ -122,6 +122,78 @@ def _clip(text: str) -> str:
     return text[:MAX_OUTPUT_CHARS] + f"\n… [{len(text) - MAX_OUTPUT_CHARS} more characters]"
 
 
+def _ensure_desktop_session() -> str:
+    """Start or join the project's shared graphical session.
+
+    The same session the person sees when they open Computer: one DISPLAY, one
+    x11vnc password, /data as the home of the file manager. Lazily started so
+    idle projects pay nothing for X.
+    """
+    root = Path(WORKSPACE_ROOT)
+    autobot = root / ".autobot"
+    ready = autobot / "desktop-ready"
+    starter = autobot / "desktop-start.sh"
+    autobot.mkdir(parents=True, exist_ok=True)
+
+    if ready.is_file():
+        # Confirm the proxy is still answering; a stale marker used to claim a
+        # dead session was live.
+        probe = subprocess.run(  # noqa: S603
+            [
+                "python3",
+                "-c",
+                "import http.client,sys;"
+                "c=http.client.HTTPConnection('127.0.0.1',6080,timeout=2);"
+                "c.request('GET','/vnc.html');"
+                "b=c.getresponse().read(200).lower();"
+                "sys.exit(0 if (b'html' in b or b'novnc' in b) else 1)",
+            ],
+            capture_output=True,
+            timeout=8,
+        )
+        if probe.returncode == 0:
+            return (
+                "Computer is already on (DISPLAY=:1). File manager, browser and "
+                "terminal share /data with Files. GUI apps you start appear there; "
+                "the person sees the same session when they open Computer."
+            )
+
+    if starter.is_file():
+        try:
+            completed = subprocess.run(  # noqa: S603
+                ["sh", str(starter), "ensure"],
+                cwd=WORKSPACE_ROOT,
+                env=_shell_env(),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                start_new_session=True,
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                "Computer is still starting. Ask the person to open Computer on "
+                "the orbit — they join this same session once the address appears."
+            )
+        except OSError as exc:
+            return f"Error: could not start Computer: {exc}"
+        if ready.is_file() or completed.returncode == 0:
+            return (
+                "Computer is on (DISPLAY=:1). File manager opens /data (same as Files). "
+                "Launch firefox-esr or a terminal with DISPLAY set — they appear on "
+                "the shared desktop the person can open from the orbit."
+            )
+        tail = (completed.stderr or completed.stdout or "").strip()[-400:]
+        return f"Error: Computer did not come up.{(' ' + tail) if tail else ''}"
+
+    return (
+        "Computer has not been started on this machine yet. Ask the person to "
+        "open Computer on the orbit once — that writes the session script — then "
+        "call ensure_computer again. Or open Computer yourself so they can take "
+        "control of the same display."
+    )
+
+
 def workspace_tools() -> list[Any]:
     """Read, write and run things on the project's own machine.
 
@@ -255,8 +327,9 @@ def workspace_tools() -> list[Any]:
             "Run a shell command on the project's machine, in the project's folder (/data). "
             "That folder is the same tree Files and the Computer file manager show. "
             "When Computer is on, DISPLAY is already set so a browser or file manager "
-            "appears on that desktop. For a site that needs a human login, ask the person "
-            "to open Computer and complete it. Returns the command's output; a command "
+            "appears on that desktop. Call ensure_computer first if you need a GUI. "
+            "For a site that needs a human login, ask the person to open Computer "
+            "and complete it. Returns the command's output; a command "
             "that takes longer than five minutes is stopped."
         )
         args_schema: type[BaseModel] = ShellArgs
@@ -287,7 +360,24 @@ def workspace_tools() -> list[Any]:
                 parts.append(f"[exit code {completed.returncode}]")
             return _clip("\n".join(parts)) if parts else "(the command produced no output)"
 
-    return [ReadFile(), WriteFile(), AppendFile(), ListFiles(), RunShell()]
+    class EnsureComputerArgs(BaseModel):
+        pass
+
+    class EnsureComputer(WorkspaceTool):
+        name = "ensure_computer"
+        description = (
+            "Start the project's shared graphical Computer if it is not already on: "
+            "a desktop with file manager on /data (same as Files), browser and terminal. "
+            "Agents and the person share one session — they open Computer on the orbit "
+            "to watch or take control. Call this before launching a GUI app or when a "
+            "site needs a human login. Idle projects keep Computer off to save memory."
+        )
+        args_schema: type[BaseModel] = EnsureComputerArgs
+
+        def _run(self) -> str:
+            return _ensure_desktop_session()
+
+    return [ReadFile(), WriteFile(), AppendFile(), ListFiles(), RunShell(), EnsureComputer()]
 
 
 # ── asking the people on the project ─────────────────────────────────────────

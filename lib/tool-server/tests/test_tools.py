@@ -53,6 +53,33 @@ def test_a_live_desktop_exports_display_into_the_shell(tmp_path, monkeypatch):
     assert env["HOME"] == "/data/.autobot/desktop-home"
 
 
+def test_ensure_computer_reports_a_live_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE_ROOT", str(tmp_path))
+    autobot = tmp_path / ".autobot"
+    autobot.mkdir()
+    (autobot / "desktop-ready").write_text("desktop-ready\n", encoding="utf-8")
+
+    class Probe:
+        returncode = 0
+
+    monkeypatch.setattr(tools.subprocess, "run", lambda *a, **k: Probe())
+    msg = tools._ensure_desktop_session()
+    assert "already on" in msg
+    assert "DISPLAY=:1" in msg
+
+
+def test_ensure_computer_asks_for_orbit_when_no_script_yet(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE_ROOT", str(tmp_path))
+    msg = tools._ensure_desktop_session()
+    assert "open Computer" in msg
+
+
+def test_ensure_computer_is_in_the_workspace_catalogue():
+    names = {t.name for t in tools.workspace_tools()}
+    assert "ensure_computer" in names
+    assert "run_shell_command" in names
+
+
 def test_the_catalogue_can_be_turned_off(monkeypatch):
     monkeypatch.setattr(tools, "_CATALOG_ENABLED", False)
     monkeypatch.setattr(tools, "_CATALOG_CACHE", None)
