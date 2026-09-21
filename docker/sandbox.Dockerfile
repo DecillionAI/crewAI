@@ -64,7 +64,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates git curl wget unzip zip tar procps jq ripgrep less \
       xvfb x11vnc x11-xserver-utils xfce4 xfce4-terminal thunar dbus-x11 \
-      novnc websockify firefox-esr \
+      novnc websockify firefox-esr chromium \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/decillion/venv /opt/decillion/venv
