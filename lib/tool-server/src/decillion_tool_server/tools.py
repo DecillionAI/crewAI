@@ -128,6 +128,11 @@ def _ensure_desktop_session() -> str:
     The same session the person sees when they open Computer: one DISPLAY, one
     x11vnc password, /data as the home of the file manager. Lazily started so
     idle projects pay nothing for X.
+
+    Agents normally reach Computer through the platform (`ensure_computer` is
+    intercepted and runs the same startDesktop path as opening Computer on the
+    orbit). This local path still joins or re-ensures when the start script is
+    already on the volume.
     """
     root = Path(WORKSPACE_ROOT)
     autobot = root / ".autobot"
@@ -172,8 +177,9 @@ def _ensure_desktop_session() -> str:
             )
         except subprocess.TimeoutExpired:
             return (
-                "Computer is still starting. Ask the person to open Computer on "
-                "the orbit — they join this same session once the address appears."
+                "Computer is still starting. Wait briefly and call ensure_computer "
+                "again — or ask the person to open Computer on the orbit to join "
+                "this same session once the address appears."
             )
         except OSError as exc:
             return f"Error: could not start Computer: {exc}"
@@ -186,11 +192,14 @@ def _ensure_desktop_session() -> str:
         tail = (completed.stderr or completed.stdout or "").strip()[-400:]
         return f"Error: Computer did not come up.{(' ' + tail) if tail else ''}"
 
+    # No start script yet: the platform should have intercepted ensure_computer
+    # and written one via startDesktop. If we still see this, ask for a retry
+    # rather than telling the agent only a person can start Computer.
     return (
-        "Computer has not been started on this machine yet. Ask the person to "
-        "open Computer on the orbit once — that writes the session script — then "
-        "call ensure_computer again. Or open Computer yourself so they can take "
-        "control of the same display."
+        "Computer is not initialized on this machine yet. Call ensure_computer "
+        "again so the platform can start the shared session (same as opening "
+        "Computer on the orbit). If that still fails, ask the person to open "
+        "Computer once, then continue."
     )
 
 
@@ -368,9 +377,10 @@ def workspace_tools() -> list[Any]:
         description = (
             "Start the project's shared graphical Computer if it is not already on: "
             "a desktop with file manager on /data (same as Files), browser and terminal. "
-            "Agents and the person share one session — they open Computer on the orbit "
-            "to watch or take control. Call this before launching a GUI app or when a "
-            "site needs a human login. Idle projects keep Computer off to save memory."
+            "Agents may start it themselves; the person opens Computer on the orbit to "
+            "watch or take control of the same session. Call this before launching a GUI "
+            "app or when a site needs a human login. Idle projects keep Computer off to "
+            "save memory."
         )
         args_schema: type[BaseModel] = EnsureComputerArgs
 

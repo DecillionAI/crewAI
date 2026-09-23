@@ -68,10 +68,11 @@ def test_ensure_computer_reports_a_live_session(tmp_path, monkeypatch):
     assert "DISPLAY=:1" in msg
 
 
-def test_ensure_computer_asks_for_orbit_when_no_script_yet(tmp_path, monkeypatch):
+def test_ensure_computer_asks_for_retry_when_no_script_yet(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "WORKSPACE_ROOT", str(tmp_path))
     msg = tools._ensure_desktop_session()
-    assert "open Computer" in msg
+    assert "ensure_computer" in msg
+    assert "platform" in msg.lower() or "retry" in msg.lower() or "again" in msg.lower()
 
 
 def test_ensure_computer_is_in_the_workspace_catalogue():
