@@ -79,6 +79,68 @@ def test_ensure_computer_is_in_the_workspace_catalogue():
     names = {t.name for t in tools.workspace_tools()}
     assert "ensure_computer" in names
     assert "run_shell_command" in names
+    assert "open_on_computer" in names
+    assert "computer_click" in names
+    assert "computer_move" in names
+    assert "computer_type" in names
+    assert "computer_key" in names
+    assert "computer_screenshot" in names
+
+
+def test_open_on_computer_refuses_when_desktop_is_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE_ROOT", str(tmp_path))
+    msg = tools._open_on_computer("https://www.youtube.com")
+    assert "ensure_computer" in msg
+    assert "open_on_computer" in msg
+
+
+def test_open_on_computer_launches_via_desktop_script(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE_ROOT", str(tmp_path))
+    autobot = tmp_path / ".autobot"
+    autobot.mkdir()
+    (autobot / "desktop-ready").write_text("ok\n", encoding="utf-8")
+    (autobot / "desktop-launch.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    seen: list[list[str]] = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            seen.append(list(cmd))
+
+    monkeypatch.setattr(tools.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(tools, "_display_size", lambda: (1280, 720))
+    msg = tools._open_on_computer("youtube.com")
+    assert "Opened https://youtube.com" in msg
+    assert "computer_click" in msg
+    assert seen and seen[0][:3] == ["sh", str(autobot / "desktop-launch.sh"), "browser"]
+    assert seen[0][3] == "https://youtube.com"
+
+
+def test_computer_click_uses_xdotool(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE_ROOT", str(tmp_path))
+    autobot = tmp_path / ".autobot"
+    autobot.mkdir()
+    (autobot / "desktop-ready").write_text("ok\n", encoding="utf-8")
+    monkeypatch.setattr(tools.shutil, "which", lambda name: "/usr/bin/xdotool" if name == "xdotool" else None)
+    seen: list[list[str]] = []
+
+    class Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        seen.append(list(cmd))
+        return Done()
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    msg = tools._xdotool("mousemove", "10", "700", "click", "1")
+    assert msg == "ok"
+    assert seen == [["/usr/bin/xdotool", "mousemove", "10", "700", "click", "1"]]
+
+
+def test_daytona_tools_are_blocklisted():
+    assert "DaytonaExecTool" in tools._CATALOG_BLOCKLIST
+    assert "DaytonaFileTool" in tools._CATALOG_BLOCKLIST
 
 
 def test_the_catalogue_can_be_turned_off(monkeypatch):

@@ -38,9 +38,11 @@ import io
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -203,6 +205,199 @@ def _ensure_desktop_session() -> str:
     )
 
 
+_COMPUTER_HINT = (
+    "Use open_on_computer to open a URL, then computer_click / computer_move / "
+    "computer_type / computer_key for the mouse and keyboard. Do not launch "
+    "chromium yourself — wrong flags crash the shared desktop."
+)
+
+
+def _computer_is_on() -> bool:
+    return (Path(WORKSPACE_ROOT) / ".autobot" / "desktop-ready").is_file()
+
+
+def _computer_off_message() -> str:
+    return (
+        "Computer is not on yet. Call ensure_computer first, wait until it says "
+        f"the session is up, then retry. {_COMPUTER_HINT}"
+    )
+
+
+def _xdotool(*args: str) -> str:
+    """Drive the shared Computer pointer/keyboard. DISPLAY comes from desktop.env."""
+    if not _computer_is_on():
+        return _computer_off_message()
+    binary = shutil.which("xdotool")
+    if not binary:
+        return (
+            "xdotool is not on this machine yet (Computer fetches it in the background "
+            "on first start). Wait about a minute and retry, or ask the person to open "
+            "Computer once so the desktop finishes installing helpers."
+        )
+    try:
+        completed = subprocess.run(  # noqa: S603
+            [binary, *args],
+            env=_shell_env(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return "Error: the Computer input command timed out"
+    except OSError as exc:
+        return f"Error: could not run xdotool: {exc}"
+    parts = []
+    if completed.stdout.strip():
+        parts.append(completed.stdout.strip())
+    if completed.stderr.strip():
+        parts.append(f"[stderr] {completed.stderr.strip()}")
+    if completed.returncode != 0:
+        parts.append(f"[exit code {completed.returncode}]")
+    return "\n".join(parts) if parts else "ok"
+
+
+def _display_size() -> tuple[int, int] | None:
+    binary = shutil.which("xdotool")
+    if not binary or not _computer_is_on():
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603
+            [binary, "getdisplaygeometry"],
+            env=_shell_env(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    parts = (completed.stdout or "").strip().split()
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def _open_on_computer(url: str) -> str:
+    """Open a URL in the project's browser with the flags that keep X alive."""
+    if not _computer_is_on():
+        return _computer_off_message()
+    target = (url or "").strip() or "about:blank"
+    if not re.match(r"^(https?://|about:)", target, re.I):
+        target = "https://" + target.lstrip("/")
+    launcher = Path(WORKSPACE_ROOT) / ".autobot" / "desktop-launch.sh"
+    env = _shell_env()
+    if launcher.is_file():
+        try:
+            subprocess.Popen(  # noqa: S603
+                ["sh", str(launcher), "browser", target],
+                cwd=WORKSPACE_ROOT,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            return f"Error: could not open the browser: {exc}"
+    else:
+        # Older sessions without an updated launcher: still prefer safe Chromium flags.
+        browser = (
+            shutil.which("chromium")
+            or shutil.which("chromium-browser")
+            or shutil.which("google-chrome")
+            or shutil.which("firefox-esr")
+            or shutil.which("firefox")
+        )
+        if not browser:
+            return "Error: no browser is installed on this machine yet."
+        cmd = [browser]
+        name = Path(browser).name
+        if "chrom" in name or "chrome" in name:
+            cmd.extend(
+                [
+                    "--user-data-dir=/tmp/decillion-browser",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ]
+            )
+        cmd.append(target)
+        try:
+            subprocess.Popen(  # noqa: S603
+                cmd,
+                cwd=WORKSPACE_ROOT,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            return f"Error: could not open the browser: {exc}"
+    size = _display_size()
+    geometry = f" Screen is {size[0]}x{size[1]}." if size else ""
+    return (
+        f"Opened {target} on Computer (DISPLAY=:1).{geometry} "
+        f"Wait a few seconds for the page to load, then use computer_click / "
+        f"computer_move / computer_type. {_COMPUTER_HINT}"
+    )
+
+
+def _computer_screenshot(path: str = "") -> str:
+    if not _computer_is_on():
+        return _computer_off_message()
+    dest = (path or "").strip() or f"/tmp/computer-{int(time.time())}.png"
+    if dest.startswith("/tmp/"):
+        out = Path(dest)
+    else:
+        try:
+            out = _resolve(dest)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return f"Error: could not create folder for screenshot: {exc}"
+    env = _shell_env()
+    attempts: list[list[str]] = []
+    scrot = shutil.which("scrot")
+    if scrot:
+        attempts.append([scrot, "-o", str(out)])
+    imagemagick = shutil.which("import")
+    if imagemagick:
+        attempts.append([imagemagick, "-window", "root", str(out)])
+    if not attempts:
+        return (
+            "No screenshot tool is installed yet (Computer fetches scrot in the background). "
+            "Wait a minute and retry."
+        )
+    last_err = ""
+    for cmd in attempts:
+        try:
+            completed = subprocess.run(  # noqa: S603
+                cmd,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last_err = str(exc)
+            continue
+        if completed.returncode == 0 and out.is_file():
+            label = str(out) if dest.startswith("/tmp/") else dest
+            return f"Saved screenshot to {label} ({out.stat().st_size} bytes)."
+        last_err = (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
+    return f"Error: screenshot failed. {last_err}".strip()
+
+
 def workspace_tools() -> list[Any]:
     """Read, write and run things on the project's own machine.
 
@@ -335,10 +530,10 @@ def workspace_tools() -> list[Any]:
         description = (
             "Run a shell command on the project's machine, in the project's folder (/data). "
             "That folder is the same tree Files and the Computer file manager show. "
-            "When Computer is on, DISPLAY is already set so a browser or file manager "
-            "appears on that desktop. Call ensure_computer first if you need a GUI. "
-            "For a site that needs a human login, ask the person to open Computer "
-            "and complete it. Returns the command's output; a command "
+            "For the shared desktop: call ensure_computer, then open_on_computer / "
+            "computer_click / computer_move — do not launch chromium yourself (wrong "
+            "flags crash Computer). For a site that needs a human login, ask the person "
+            "to open Computer and complete it. Returns the command's output; a command "
             "that takes longer than five minutes is stopped."
         )
         args_schema: type[BaseModel] = ShellArgs
@@ -378,16 +573,131 @@ def workspace_tools() -> list[Any]:
             "Start the project's shared graphical Computer if it is not already on: "
             "a desktop with file manager on /data (same as Files), browser and terminal. "
             "Agents may start it themselves; the person opens Computer on the orbit to "
-            "watch or take control of the same session. Call this before launching a GUI "
-            "app or when a site needs a human login. Idle projects keep Computer off to "
-            "save memory."
+            "watch or take control of the same session. Call this before open_on_computer "
+            "or computer_click. Idle projects keep Computer off to save memory."
         )
         args_schema: type[BaseModel] = EnsureComputerArgs
 
         def _run(self) -> str:
-            return _ensure_desktop_session()
+            msg = _ensure_desktop_session()
+            if "Computer is on" in msg or "already on" in msg:
+                return f"{msg} {_COMPUTER_HINT}"
+            return msg
 
-    return [ReadFile(), WriteFile(), AppendFile(), ListFiles(), RunShell(), EnsureComputer()]
+    class OpenOnComputerArgs(BaseModel):
+        url: str = Field(description="URL to open in the shared Computer browser (https://…)")
+
+    class OpenOnComputer(WorkspaceTool):
+        name = "open_on_computer"
+        description = (
+            "Open a URL in the project's shared Computer browser (safe Chromium/Firefox "
+            "flags). Call ensure_computer first. Then use computer_click / computer_move "
+            "to interact. Do not use run_shell_command to launch a browser."
+        )
+        args_schema: type[BaseModel] = OpenOnComputerArgs
+
+        def _run(self, url: str) -> str:
+            return _open_on_computer(url)
+
+    class ComputerClickArgs(BaseModel):
+        x: int = Field(description="Horizontal pixel position on the Computer screen")
+        y: int = Field(description="Vertical pixel position on the Computer screen")
+        button: int = Field(default=1, description="Mouse button: 1=left, 2=middle, 3=right")
+
+    class ComputerClick(WorkspaceTool):
+        name = "computer_click"
+        description = (
+            "Click at a pixel on the shared Computer screen (DISPLAY=:1). "
+            "Call ensure_computer and open_on_computer first. Bottom-left of an "
+            "WxH screen is near (5, H-5)."
+        )
+        args_schema: type[BaseModel] = ComputerClickArgs
+
+        def _run(self, x: int, y: int, button: int = 1) -> str:
+            result = _xdotool("mousemove", str(int(x)), str(int(y)), "click", str(int(button) or 1))
+            if result.startswith("Error") or "not on" in result or "not on this" in result:
+                return result
+            return f"Clicked ({int(x)}, {int(y)}) button {int(button) or 1}. {result}".strip()
+
+    class ComputerMoveArgs(BaseModel):
+        x: int = Field(description="Horizontal pixel position on the Computer screen")
+        y: int = Field(description="Vertical pixel position on the Computer screen")
+
+    class ComputerMove(WorkspaceTool):
+        name = "computer_move"
+        description = (
+            "Move the mouse pointer on the shared Computer without clicking. "
+            "Bottom-left of an WxH screen is near (5, H-5)."
+        )
+        args_schema: type[BaseModel] = ComputerMoveArgs
+
+        def _run(self, x: int, y: int) -> str:
+            result = _xdotool("mousemove", str(int(x)), str(int(y)))
+            if result.startswith("Error") or "not on" in result or "xdotool is not" in result:
+                return result
+            return f"Moved pointer to ({int(x)}, {int(y)}). {result}".strip()
+
+    class ComputerTypeArgs(BaseModel):
+        text: str = Field(description="Text to type into the focused window on Computer")
+
+    class ComputerType(WorkspaceTool):
+        name = "computer_type"
+        description = "Type text into the focused window on the shared Computer."
+        args_schema: type[BaseModel] = ComputerTypeArgs
+
+        def _run(self, text: str) -> str:
+            result = _xdotool("type", "--clearmodifiers", "--", str(text))
+            if result.startswith("Error") or "not on" in result or "xdotool is not" in result:
+                return result
+            return f"Typed {len(str(text))} characters. {result}".strip()
+
+    class ComputerKeyArgs(BaseModel):
+        key: str = Field(
+            description="Key name for xdotool (Return, Tab, Escape, ctrl+a, …)"
+        )
+
+    class ComputerKey(WorkspaceTool):
+        name = "computer_key"
+        description = "Press a key or key combo on the shared Computer (Return, Tab, ctrl+l, …)."
+        args_schema: type[BaseModel] = ComputerKeyArgs
+
+        def _run(self, key: str) -> str:
+            result = _xdotool("key", "--clearmodifiers", str(key))
+            if result.startswith("Error") or "not on" in result or "xdotool is not" in result:
+                return result
+            return f"Pressed {key}. {result}".strip()
+
+    class ComputerScreenshotArgs(BaseModel):
+        path: str = Field(
+            default="",
+            description="Optional path under the project (or /tmp/…). Empty = /tmp/computer-….png",
+        )
+
+    class ComputerScreenshot(WorkspaceTool):
+        name = "computer_screenshot"
+        description = (
+            "Capture the shared Computer screen to a PNG. Use this to verify a page "
+            "loaded or a click landed before claiming the browser task succeeded."
+        )
+        args_schema: type[BaseModel] = ComputerScreenshotArgs
+
+        def _run(self, path: str = "") -> str:
+            return _computer_screenshot(path)
+
+    return [
+        ReadFile(),
+        WriteFile(),
+        AppendFile(),
+        ListFiles(),
+        RunShell(),
+        EnsureComputer(),
+        OpenOnComputer(),
+        ComputerClick(),
+        ComputerMove(),
+        ComputerType(),
+        ComputerKey(),
+        ComputerScreenshot(),
+    ]
 
 
 # ── asking the people on the project ─────────────────────────────────────────
@@ -466,6 +776,19 @@ def warm_catalog() -> int:
     return len(catalog_tools())
 
 
+#: Catalogue tools that look buildable but belong to a different product. Offering
+#: them burns a turn: the agent picks Daytona (or similar), learns the package is
+#: missing, and never uses the project's own Computer tools that actually work.
+_CATALOG_BLOCKLIST = frozenset(
+    {
+        "DaytonaExecTool",
+        "DaytonaFileTool",
+        "DaytonaPythonTool",
+        "DaytonaBaseTool",
+    }
+)
+
+
 def _build_catalog() -> list[Any]:
     """The catalogue itself. Call under `_CATALOG_LOCK`."""
     global _CATALOG_CACHE
@@ -490,6 +813,9 @@ def _build_catalog() -> list[Any]:
     with _auto_approve(), _installable():
         for name in sorted(getattr(crewai_tools, "__all__", []) or dir(crewai_tools)):
             if not name.endswith("Tool") or name.startswith("_"):
+                continue
+            if name in _CATALOG_BLOCKLIST or name.startswith("Daytona"):
+                logger.debug("skipping %s: foreign sandbox tool, not this project's machine", name)
                 continue
             candidate = getattr(crewai_tools, name, None)
             if not isinstance(candidate, type):
