@@ -188,7 +188,7 @@ def _ensure_desktop_session() -> str:
         if ready.is_file() or completed.returncode == 0:
             return (
                 "Computer is on (DISPLAY=:1). File manager opens /data (same as Files). "
-                "Launch firefox-esr or a terminal with DISPLAY set — they appear on "
+                "Launch Chromium or a terminal with DISPLAY set — they appear on "
                 "the shared desktop the person can open from the orbit."
             )
         tail = (completed.stderr or completed.stdout or "").strip()[-400:]
@@ -282,6 +282,87 @@ def _display_size() -> tuple[int, int] | None:
         return None
 
 
+def _browser_pids() -> list[int]:
+    pids: list[int] = []
+    for name in ("chromium", "chromium-browser", "chrome", "google-chrome", "google-chrome-stable"):
+        try:
+            completed = subprocess.run(  # noqa: S603
+                ["pgrep", "-x", name],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        for line in (completed.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+    return pids
+
+
+def _raise_browser_window() -> None:
+    """Bring the shared browser to the front of DISPLAY=:1 for orbit VNC."""
+    if not shutil.which("xdotool"):
+        return
+    env = _shell_env()
+    for pattern in ("Chromium", "Chrome", "Google-chrome"):
+        try:
+            found = subprocess.run(  # noqa: S603
+                ["xdotool", "search", "--onlyvisible", "--class", pattern],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        wid = (found.stdout or "").strip().splitlines()
+        if not wid:
+            continue
+        try:
+            subprocess.run(  # noqa: S603
+                ["xdotool", "windowactivate", "--sync", wid[-1]],
+                env=env,
+                capture_output=True,
+                timeout=5,
+            )
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+
+def _navigate_existing_browser(url: str) -> bool:
+    """Type a URL into the front browser tab (avoids blank extra tabs)."""
+    if not shutil.which("xdotool") or not _browser_pids():
+        return False
+    _raise_browser_window()
+    env = _shell_env()
+    try:
+        subprocess.run(  # noqa: S603
+            ["xdotool", "key", "--clearmodifiers", "ctrl+l"],
+            env=env,
+            capture_output=True,
+            timeout=5,
+        )
+        time.sleep(0.3)
+        subprocess.run(  # noqa: S603
+            ["xdotool", "type", "--clearmodifiers", "--delay", "8", url],
+            env=env,
+            capture_output=True,
+            timeout=30,
+        )
+        subprocess.run(  # noqa: S603
+            ["xdotool", "key", "--clearmodifiers", "Return"],
+            env=env,
+            capture_output=True,
+            timeout=5,
+        )
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _open_on_computer(url: str) -> str:
     """Open a URL in the project's browser with the flags that keep X alive."""
     if not _computer_is_on():
@@ -289,6 +370,22 @@ def _open_on_computer(url: str) -> str:
     target = (url or "").strip() or "about:blank"
     if not re.match(r"^(https?://|about:)", target, re.I):
         target = "https://" + target.lstrip("/")
+
+    # Prefer navigating an already-open browser. Spawning chromium again with
+    # the same user-data-dir often leaves blank tabs the person sees on orbit
+    # while screenshots still capture something off to the side.
+    if _navigate_existing_browser(target):
+        time.sleep(2.5)
+        _raise_browser_window()
+        size = _display_size()
+        geometry = f" Screen is {size[0]}x{size[1]}." if size else ""
+        return (
+            f"Opened {target} on Computer (DISPLAY=:1) in the existing browser.{geometry} "
+            f"The person sees this same window when they open Computer on the orbit. "
+            f"Wait a moment for the page to finish loading, then screenshot or click. "
+            f"{_COMPUTER_HINT}"
+        )
+
     launcher = Path(WORKSPACE_ROOT) / ".autobot" / "desktop-launch.sh"
     env = _shell_env()
     if launcher.is_file():
@@ -305,16 +402,15 @@ def _open_on_computer(url: str) -> str:
         except OSError as exc:
             return f"Error: could not open the browser: {exc}"
     else:
-        # Older sessions without an updated launcher: still prefer safe Chromium flags.
+        # Older sessions without an updated launcher: Chromium only.
         browser = (
             shutil.which("chromium")
             or shutil.which("chromium-browser")
             or shutil.which("google-chrome")
-            or shutil.which("firefox-esr")
-            or shutil.which("firefox")
+            or shutil.which("google-chrome-stable")
         )
         if not browser:
-            return "Error: no browser is installed on this machine yet."
+            return "Error: Chromium is not installed on this machine yet."
         cmd = [browser]
         name = Path(browser).name
         if "chrom" in name or "chrome" in name:
@@ -341,12 +437,15 @@ def _open_on_computer(url: str) -> str:
             )
         except OSError as exc:
             return f"Error: could not open the browser: {exc}"
+    time.sleep(3.5)
+    _raise_browser_window()
     size = _display_size()
     geometry = f" Screen is {size[0]}x{size[1]}." if size else ""
     return (
         f"Opened {target} on Computer (DISPLAY=:1).{geometry} "
-        f"Wait a few seconds for the page to load, then use computer_click / "
-        f"computer_move / computer_type. {_COMPUTER_HINT}"
+        f"The browser window is raised on the shared desktop the person sees. "
+        f"Wait a few seconds for the page to load, then use computer_screenshot / "
+        f"computer_click. {_COMPUTER_HINT}"
     )
 
 
