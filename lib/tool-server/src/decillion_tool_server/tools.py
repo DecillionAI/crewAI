@@ -350,6 +350,34 @@ def _open_on_computer(url: str) -> str:
     )
 
 
+def _ensure_screenshot_binaries() -> str:
+    """Install scrot on demand when Computer is up but helpers are still fetching.
+
+    Desktop start deliberately does not block on apt; screenshot is the first
+    moment we need the binary, so try a short install here instead of failing.
+    """
+    if shutil.which("scrot") or shutil.which("import"):
+        return ""
+    try:
+        completed = subprocess.run(  # noqa: S603
+            [
+                "sh",
+                "-c",
+                "DEBIAN_FRONTEND=noninteractive apt-get update -qq "
+                "&& apt-get install -y --no-install-recommends scrot",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"Could not install screenshot tools yet ({exc})."
+    if shutil.which("scrot") or shutil.which("import"):
+        return ""
+    tail = (completed.stderr or completed.stdout or "").strip()[-200:]
+    return f"Screenshot tools still missing after install attempt. {tail}".strip()
+
+
 def _computer_screenshot(path: str = "") -> str:
     if not _computer_is_on():
         return _computer_off_message()
@@ -374,10 +402,18 @@ def _computer_screenshot(path: str = "") -> str:
     if imagemagick:
         attempts.append([imagemagick, "-window", "root", str(out)])
     if not attempts:
-        return (
-            "No screenshot tool is installed yet (Computer fetches scrot in the background). "
-            "Wait a minute and retry."
-        )
+        install_err = _ensure_screenshot_binaries()
+        scrot = shutil.which("scrot")
+        if scrot:
+            attempts.append([scrot, "-o", str(out)])
+        imagemagick = shutil.which("import")
+        if imagemagick:
+            attempts.append([imagemagick, "-window", "root", str(out)])
+        if not attempts:
+            return (
+                "No screenshot tool is installed yet. "
+                + (install_err or "Wait a minute and retry computer_screenshot.")
+            )
     last_err = ""
     for cmd in attempts:
         try:
@@ -474,12 +510,18 @@ def workspace_tools() -> list[Any]:
                 target = _resolve(path)
             except ValueError as exc:
                 return f"Error: {exc}"
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(str(content), encoding="utf-8")
-            except OSError as exc:
-                return f"Error: could not write {path}: {exc}"
-            return f"Wrote {len(str(content))} characters to {path}"
+            last_err = ""
+            for attempt in range(2):
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(str(content), encoding="utf-8")
+                    return f"Wrote {len(str(content))} characters to {path}"
+                except OSError as exc:
+                    last_err = str(exc)
+                    if attempt == 0:
+                        time.sleep(0.4)
+                        continue
+            return f"Error: could not write {path}: {last_err}"
 
     class AppendFile(WorkspaceTool):
         name = "append_project_file"

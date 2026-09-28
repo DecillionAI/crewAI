@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -234,6 +235,25 @@ def test_a_tool_whose_schema_a_provider_refuses_is_not_offered():
     ]
     # A tool with no schema at all takes no arguments; that is fine.
     assert tools._unsupported_schema(object()) == []
+
+
+def test_write_project_file_retries_once_on_oserror(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE_ROOT", str(tmp_path))
+    calls = {"n": 0}
+    real = Path.write_text
+
+    def flaky(self, data, encoding=None, errors=None, newline=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("busy")
+        return real(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    monkeypatch.setattr(Path, "write_text", flaky)
+    write = next(t for t in tools.workspace_tools() if t.name == "write_project_file")
+    out = write.run(path="note.md", content="hi")
+    assert "Wrote" in out
+    assert calls["n"] == 2
+    assert (tmp_path / "note.md").read_text() == "hi"
 
 
 def test_the_install_target_is_set_up_and_put_back(tmp_path, monkeypatch):
