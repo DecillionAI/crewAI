@@ -454,6 +454,8 @@ def _ensure_screenshot_binaries() -> str:
 
     Desktop start deliberately does not block on apt; screenshot is the first
     moment we need the binary, so try a short install here instead of failing.
+    Wait on the dpkg lock — racing desktop's detached apt is how the first
+    screenshot failed with "Could not get lock … held by process … apt-get".
     """
     if shutil.which("scrot") or shutil.which("import"):
         return ""
@@ -462,12 +464,13 @@ def _ensure_screenshot_binaries() -> str:
             [
                 "sh",
                 "-c",
-                "DEBIAN_FRONTEND=noninteractive apt-get update -qq "
-                "&& apt-get install -y --no-install-recommends scrot",
+                "flock -w 120 /var/lib/dpkg/lock-frontend sh -c "
+                "'DEBIAN_FRONTEND=noninteractive apt-get update -qq "
+                "&& apt-get install -y --no-install-recommends scrot'",
             ],
             capture_output=True,
             text=True,
-            timeout=90,
+            timeout=150,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"Could not install screenshot tools yet ({exc})."
