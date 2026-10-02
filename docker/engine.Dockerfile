@@ -37,7 +37,7 @@ COPY lib/crewai-core /src/lib/crewai-core
 COPY lib/cli /src/lib/cli
 COPY lib/crewai /src/lib/crewai
 RUN pip install --upgrade pip setuptools wheel \
- && pip install /src/lib/crewai-core /src/lib/cli /src/lib/crewai
+ && pip install /src/lib/crewai-core /src/lib/cli "/src/lib/crewai[google-genai]"
 
 # ── runtime ─────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
